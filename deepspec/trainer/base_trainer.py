@@ -23,9 +23,11 @@ from deepspec.utils import (
 )
 from deepspec.trainer.ckpt_manager import (
     discover_latest_checkpoint,
+    load_external_draft_model,
     load_resume_draft_model,
     load_training_state,
     save_checkpoint,
+    select_draft_initialization,
 )
 import deepspec.utils.training_logger as training_logger
 from deepspec.utils.hfai_suspend import SuspendController
@@ -166,14 +168,20 @@ class BaseTrainer:
         self.suspend_controller = SuspendController(device=self.device)
         self.next_micro_step = 0
 
-        if is_global_main_process(): ensure_dir(self.checkpoint_dir_root)
+        if is_global_main_process():
+            ensure_dir(self.checkpoint_dir_root)
         training_logger.init(
             logging_steps=int(self.args.logging.logging_steps),
             tensorboard_dir=self.args.logging.tensorboard_dir,
         )
 
         self.draft_model, self.tokenizer = self.build_models()
-        if self.resume_checkpoint_dir is not None:
+        initialization = select_draft_initialization(
+            resume_checkpoint_dir=self.resume_checkpoint_dir,
+            init_name_or_path=self.args.model.get("init_draft_name_or_path"),
+            init_revision=self.args.model.get("init_draft_revision"),
+        )
+        if initialization == "resume":
             self.draft_model = load_resume_draft_model(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
                 draft_model=self.draft_model,
@@ -181,13 +189,25 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
+        elif initialization == "external":
+            self.draft_model = load_external_draft_model(
+                init_name_or_path=self.args.model.init_draft_name_or_path,
+                init_revision=self.args.model.init_draft_revision,
+                draft_model=self.draft_model,
+                device=self.device,
+                precision_dtype=self.precision_dtype,
+            )
+            print_on_local_main(
+                "Starting a fresh stage from external draft weights; "
+                "optimizer, scheduler, step, RNG, and sampler state are fresh."
+            )
         self.model = self.draft_model
         if self.args.train.torch_compile:
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
 
-        self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
+        self.train_dataset = self.build_train_dataset()
         validate_train_cache(
             train_dataset=self.train_dataset,
             draft_model=self.draft_model,
@@ -218,7 +238,7 @@ class BaseTrainer:
             warmup_ratio=float(self.args.train.warmup_ratio),
             weight_decay=float(self.args.train.weight_decay),
         )
-        if self.resume_checkpoint_dir is not None:
+        if initialization == "resume":
             resume_state = load_training_state(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
                 optimizer=self.optimizer,
@@ -229,9 +249,12 @@ class BaseTrainer:
                 micro_batches_per_epoch=self.micro_batches_per_epoch,
             )
             self.next_micro_step = resume_state.next_micro_step
-        else:
+        elif initialization == "scratch":
             print_on_local_main("Training from scratch.")
         self.info_board()
+
+    def build_train_dataset(self):
+        return CacheDataset(cache_dir=self.args.data.target_cache_path)
 
     @property
     def global_step(self):
@@ -250,12 +273,18 @@ class BaseTrainer:
 
     def build_models(self):
         model_args = self.args.model
+        revision_kwargs = {}
+        target_revision = model_args.get("target_revision")
+        if target_revision is not None:
+            revision_kwargs["revision"] = target_revision
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.target_model_name_or_path,
+            **revision_kwargs,
         )
         target_config = AutoConfig.from_pretrained(
             model_args.target_model_name_or_path,
+            **revision_kwargs,
         )
 
         draft_model = self._build_draft_model(
@@ -269,7 +298,9 @@ class BaseTrainer:
         target_model = AutoModelForCausalLM.from_pretrained(
             model_args.target_model_name_or_path,
             dtype=self.precision_dtype,
+            **revision_kwargs,
         ).to(device="cpu").eval()
+        self.capture_target_model(target_model)
         target_embed_tokens = target_model.get_input_embeddings()
         target_lm_head = target_model.get_output_embeddings()
         assert (target_lm_head is not None) and (target_embed_tokens is not None)
@@ -280,6 +311,9 @@ class BaseTrainer:
         )
         del target_model
         return draft_model, tokenizer
+
+    def capture_target_model(self, target_model):
+        return None
 
     def _build_draft_model(self, *, target_config, model_args):
         raise NotImplementedError
@@ -315,6 +349,33 @@ class BaseTrainer:
 
     def run_batch(self, batch):
         raise NotImplementedError
+
+    def record_batch_consumed(self, batch):
+        source_indices = batch.get("_live_source_indices")
+        epoch_indices = batch.get("_live_epoch_indices")
+        source_row_ids = batch.get("_live_source_row_ids")
+        visit_ids = batch.get("_live_visit_ids")
+        metadata = (source_indices, epoch_indices, source_row_ids, visit_ids)
+        if all(value is None for value in metadata):
+            return
+        if any(value is None for value in metadata):
+            raise ValueError("live batch consumption metadata is incomplete")
+        recorder = getattr(self.train_dataset, "record_batch_consumed", None)
+        if recorder is None:
+            raise ValueError("live batch metadata has no dataset consumption owner")
+        recorder(
+            source_indices=source_indices.detach().cpu().tolist(),
+            epoch_indices=epoch_indices.detach().cpu().tolist(),
+            source_row_ids=[
+                bytes(value).hex()
+                for value in source_row_ids.detach().cpu().tolist()
+            ],
+            visit_ids=[
+                bytes(value).hex() for value in visit_ids.detach().cpu().tolist()
+            ],
+            global_step=self.global_step,
+            micro_step=self.next_micro_step,
+        )
 
     def _checkpoint_kwargs(self):
         return dict(
@@ -379,6 +440,7 @@ class BaseTrainer:
                     loss = self.run_batch(batch) / self.gradient_accumulation_steps
                     loss.backward()
                 self.next_micro_step += 1
+                self.record_batch_consumed(batch)
 
                 if not should_sync:
                     continue

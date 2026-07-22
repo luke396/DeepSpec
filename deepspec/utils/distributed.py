@@ -118,6 +118,11 @@ class StatelessResumableDistributedSampler(Sampler):
     def _epoch_slice_for_rank(self, perm):
         return perm[self.rank : self.total_size : self.num_replicas]
 
+    def _sample_key(self, source_index: int, epoch_index: int):
+        if getattr(self.dataset, "requires_epoch_index", False):
+            return source_index, epoch_index
+        return source_index
+
     def _iter_stream(self):
         epoch_idx = self._global_offset // self.per_rank_len_per_epoch
         offset_in_epoch = self._global_offset % self.per_rank_len_per_epoch
@@ -125,14 +130,14 @@ class StatelessResumableDistributedSampler(Sampler):
         perm = self._epoch_perm(epoch_idx)
         my_seq = self._epoch_slice_for_rank(perm)
         for i in range(offset_in_epoch, len(my_seq)):
-            yield my_seq[i]
+            yield self._sample_key(my_seq[i], epoch_idx)
 
         epoch_idx += 1
         while True:
             perm = self._epoch_perm(epoch_idx)
             my_seq = self._epoch_slice_for_rank(perm)
             for idx in my_seq:
-                yield idx
+                yield self._sample_key(idx, epoch_idx)
             epoch_idx += 1
 
     def __iter__(self):
