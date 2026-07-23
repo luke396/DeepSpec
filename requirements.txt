@@ -16,4 +16,3 @@ prettytable==3.17.0
 # Data preparation dependencies.
 datasets==4.8.5
 openai==2.6.1
-speculators @ git+https://github.com/luke396/speculators.git@ec46055fdfe0a02fe94dfcb6fb229e23f2b2c3fb

@@ -19,7 +19,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
     data_collator_cls = CacheCollator
 
     def capture_target_model(self, target_model):
-        if self.args.data.get("live_data_path") is None:
+        if self.args.data.get("train_jsonl_path") is None:
             return
         if getattr(target_model.config, "model_type", None) != "qwen3":
             raise ValueError("live hidden training currently supports only Qwen3")
@@ -36,19 +36,24 @@ class Qwen3DSparkTrainer(BaseTrainer):
 
     def build_train_dataset(self):
         data_args = self.args.data
-        live_data_path = data_args.get("live_data_path")
-        if live_data_path is None:
+        train_jsonl_path = data_args.get("train_jsonl_path")
+        if train_jsonl_path is None:
             return super().build_train_dataset()
         if data_args.get("target_cache_path") is not None:
             raise ValueError(
-                "live_data_path and target_cache_path are mutually exclusive"
+                "train_jsonl_path and target_cache_path are mutually exclusive"
             )
-        from deepspec.data.live_hidden_adapter import LiveHiddenAdapter
+        from deepspec.data.live_hidden_dataset import LiveHiddenDataset
 
-        return LiveHiddenAdapter(
-            datapath=live_data_path,
+        return LiveHiddenDataset(
+            data_path=train_jsonl_path,
+            tokenizer=self.tokenizer,
+            chat_template=data_args.chat_template,
             max_length=int(data_args.max_length),
+            min_loss_tokens=int(data_args.min_loss_tokens),
             vllm_endpoint=data_args.vllm_endpoint,
+            vllm_model=data_args.vllm_model,
+            hidden_states_path=data_args.hidden_states_path,
             target_model_name_or_path=self.args.model.target_model_name_or_path,
             target_revision=self.args.model.target_revision,
             target_layer_ids=self.draft_model.target_layer_ids,

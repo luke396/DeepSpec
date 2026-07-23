@@ -54,11 +54,14 @@ logging = dict(
 
 data = dict(
     target_cache_path=None,
-    live_data_path=None,
+    train_jsonl_path=None,
     vllm_endpoint=None,
+    vllm_model=None,
+    hidden_states_path=None,
     expected_num_samples=None,
     chat_template="qwen",
     max_length=4096,
+    min_loss_tokens=14,
     num_workers=4,
 )
 
