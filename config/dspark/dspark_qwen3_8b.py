@@ -9,6 +9,9 @@ seed = 42
 
 model = dict(
     target_model_name_or_path=QWEN_3_8B,
+    target_revision=None,
+    init_draft_name_or_path=None,
+    init_draft_revision=None,
     block_size=7,
     num_draft_layers=5,
     target_layer_ids=[1, 9, 17, 25, 33],
@@ -51,6 +54,9 @@ logging = dict(
 
 data = dict(
     target_cache_path=None,
+    live_data_path=None,
+    vllm_endpoint=None,
+    expected_num_samples=None,
     chat_template="qwen",
     max_length=4096,
     num_workers=4,

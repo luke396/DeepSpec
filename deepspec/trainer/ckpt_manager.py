@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import shutil
 from dataclasses import dataclass
 
@@ -20,6 +21,36 @@ from deepspec.utils import (
 
 
 TRAIN_CONFIG_FILE_NAME = "train_config.py"
+_GIT_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_EXTERNAL_DRAFT_CONFIG_FIELDS = (
+    "model_type",
+    "architectures",
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "num_target_layers",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "hidden_act",
+    "attention_bias",
+    "attention_dropout",
+    "rms_norm_eps",
+    "rope_parameters",
+    "max_position_embeddings",
+    "layer_types",
+    "sliding_window",
+    "block_size",
+    "target_layer_ids",
+    "mask_token_id",
+    "num_anchors",
+    "tie_word_embeddings",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+    "markov_rank",
+    "markov_head_type",
+)
 
 
 def discover_latest_checkpoint(checkpoint_dir):
@@ -27,6 +58,86 @@ def discover_latest_checkpoint(checkpoint_dir):
     if not (os.path.islink(latest_link) or os.path.isdir(latest_link)):
         return None
     return os.path.realpath(latest_link)
+
+
+def select_draft_initialization(
+    *,
+    resume_checkpoint_dir: str | None,
+    init_name_or_path: str | None,
+    init_revision: str | None,
+) -> str:
+    if resume_checkpoint_dir is not None:
+        return "resume"
+    has_path = isinstance(init_name_or_path, str) and bool(init_name_or_path)
+    has_revision = isinstance(init_revision, str) and bool(init_revision)
+    if has_path != has_revision:
+        raise ValueError(
+            "external draft init requires both init_draft_name_or_path and "
+            "init_draft_revision"
+        )
+    if has_revision and not _GIT_REVISION_RE.fullmatch(init_revision):
+        raise ValueError(
+            "external draft init revision must be a lowercase 40-character git SHA"
+        )
+    return "external" if has_path else "scratch"
+
+
+def _validate_external_draft(*, expected_model, loaded_model) -> None:
+    for field in _EXTERNAL_DRAFT_CONFIG_FIELDS:
+        expected = getattr(expected_model.config, field, None)
+        loaded = getattr(loaded_model.config, field, None)
+        if loaded != expected:
+            raise ValueError(
+                f"external draft config.{field} mismatch: {loaded!r} != {expected!r}"
+            )
+
+
+def load_external_draft_model(
+    *,
+    init_name_or_path: str,
+    init_revision: str,
+    draft_model,
+    device,
+    precision_dtype,
+):
+    if not _GIT_REVISION_RE.fullmatch(init_revision):
+        raise ValueError(
+            "external draft init revision must be a lowercase 40-character git SHA"
+        )
+    loaded_model, loading_info = type(draft_model).from_pretrained(
+        init_name_or_path,
+        revision=init_revision,
+        dtype=precision_dtype,
+        attn_implementation=str(draft_model.config._attn_implementation),
+        output_loading_info=True,
+    )
+    for field in (
+        "missing_keys",
+        "unexpected_keys",
+        "mismatched_keys",
+        "error_msgs",
+    ):
+        if loading_info.get(field):
+            raise ValueError(
+                f"external draft loader reported {field}: {loading_info[field]}"
+            )
+    resolved_revision = getattr(loaded_model.config, "_commit_hash", None)
+    if resolved_revision is not None and resolved_revision != init_revision:
+        raise ValueError(
+            "external draft resolved revision mismatch: "
+            f"{resolved_revision} != {init_revision}"
+        )
+    _validate_external_draft(
+        expected_model=draft_model,
+        loaded_model=loaded_model,
+    )
+    loaded_model = loaded_model.to(device=device, dtype=precision_dtype)
+    loaded_model.initialize_embeddings_and_head(
+        embed_tokens=draft_model.embed_tokens,
+        lm_head=draft_model.lm_head,
+        freeze=True,
+    )
+    return loaded_model
 
 
 def save_train_config(*, train_config, checkpoint_dir: str) -> str:
