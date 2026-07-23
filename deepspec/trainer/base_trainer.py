@@ -399,6 +399,7 @@ class BaseTrainer:
             num_samples=remaining_samples,
         )
         prefetcher = CUDAPrefetcher(dataloader, self.device)
+        checkpointing_steps = int(self.args.logging.checkpointing_steps)
         training_logger.start_session(global_step=self.global_step)
 
         with self.suspend_controller.monitoring():
@@ -429,14 +430,15 @@ class BaseTrainer:
                     grad_norm=grad_norm.item(),
                 )
 
-                if self.global_step % int(self.args.logging.checkpointing_steps) == 0:
+                if self.global_step % checkpointing_steps == 0:
                     self.save_and_eval_checkpoint()
 
                 if self.suspend_controller.requested():
                     self._save_and_suspend()
                     return
 
-        self.save_and_eval_checkpoint()
+        if self.global_step % checkpointing_steps != 0:
+            self.save_and_eval_checkpoint()
 
     def clean_up(self):
         training_logger.close()
