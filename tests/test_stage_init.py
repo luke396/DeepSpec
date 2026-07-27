@@ -40,6 +40,7 @@ def _config():
 class FakeDraftModel:
     loaded_model = None
     loading_info = None
+    config_arg = None
 
     def __init__(self, *, config=None):
         self.config = config or _config()
@@ -54,7 +55,7 @@ class FakeDraftModel:
         assert path == "published-draft"
         assert kwargs["revision"] == REVISION
         assert kwargs["output_loading_info"] is True
-        cls.loaded_model.config = kwargs["config"]
+        cls.config_arg = kwargs["config"]
         return cls.loaded_model, cls.loading_info
 
     def to(self, *, device, dtype):
@@ -118,7 +119,7 @@ def test_external_init_loads_only_exact_compatible_weights():
 
     assert result is loaded
     assert result.embedding_head_trainable is False
-    assert result.config is expected.config
+    assert FakeDraftModel.config_arg is expected.config
     assert result.initialized_from == (expected.embed_tokens, expected.lm_head)
     assert result.to_args == (torch.device("cpu"), torch.bfloat16)
 
