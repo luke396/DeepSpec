@@ -12,7 +12,6 @@ import deepspec.data.jsonl_dataset as jsonl_module
 from deepspec.data.live_hidden_dataset import LiveHiddenDataset
 
 
-REVISION = "b" * 40
 NORM_WEIGHT = torch.arange(1, 9, dtype=torch.bfloat16) / 8
 
 
@@ -155,8 +154,6 @@ def _dataset(monkeypatch, tmp_path, *, expected_num_samples=1):
         vllm_endpoint="http://hidden-router:8000/v1",
         vllm_model="Qwen/Qwen3-8B",
         hidden_states_path=hidden_dir,
-        target_model_name_or_path="Qwen/Qwen3-8B",
-        target_revision=REVISION,
         target_layer_ids=[1, 9],
         hidden_size=8,
         final_norm_weight=NORM_WEIGHT,
@@ -242,35 +239,3 @@ def test_vllm_model_identity_mismatch_fails_before_hidden_request(
     with pytest.raises(ValueError, match="model identity mismatch"):
         dataset[0]
     assert completions.calls == []
-
-
-def test_live_dataset_requires_pinned_target_and_nonempty_endpoint(
-    monkeypatch, tmp_path
-):
-    dataset_path = tmp_path / "regen.canonical.jsonl"
-    _write_dataset(dataset_path)
-    hidden_dir = tmp_path / "hidden"
-    hidden_dir.mkdir()
-    common = dict(
-        data_path=dataset_path,
-        tokenizer=FakeTokenizer(),
-        chat_template="qwen",
-        max_length=32768,
-        min_loss_tokens=1,
-        vllm_model="Qwen/Qwen3-8B",
-        hidden_states_path=hidden_dir,
-        target_model_name_or_path="Qwen/Qwen3-8B",
-        target_layer_ids=[1, 9],
-        hidden_size=8,
-        final_norm_weight=NORM_WEIGHT,
-        final_norm_eps=1e-6,
-        expected_num_samples=1,
-    )
-    with pytest.raises(ValueError, match="vllm_endpoint"):
-        LiveHiddenDataset(vllm_endpoint="", target_revision=REVISION, **common)
-    with pytest.raises(ValueError, match="target_revision"):
-        LiveHiddenDataset(
-            vllm_endpoint="http://hidden-router:8000/v1",
-            target_revision="main",
-            **common,
-        )

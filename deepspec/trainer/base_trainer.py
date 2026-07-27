@@ -207,11 +207,6 @@ class BaseTrainer:
         self.model = self._wrap_with_fsdp(self.model)
 
         self.train_dataset = self.build_train_dataset()
-        validate_train_cache(
-            train_dataset=self.train_dataset,
-            draft_model=self.draft_model,
-            target_model_name_or_path=self.args.model.target_model_name_or_path,
-        )
 
         (
             self.gradient_accumulation_steps,
@@ -253,7 +248,13 @@ class BaseTrainer:
         self.info_board()
 
     def build_train_dataset(self):
-        return CacheDataset(cache_dir=self.args.data.target_cache_path)
+        train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
+        validate_train_cache(
+            train_dataset=train_dataset,
+            draft_model=self.draft_model,
+            target_model_name_or_path=self.args.model.target_model_name_or_path,
+        )
+        return train_dataset
 
     @property
     def global_step(self):

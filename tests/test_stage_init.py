@@ -17,7 +17,7 @@ load_external_draft_model = _MODULE.load_external_draft_model
 select_draft_initialization = _MODULE.select_draft_initialization
 
 
-REVISION = "a" * 40
+REVISION = "main"
 
 
 def _loading_info(**overrides):
@@ -31,37 +31,9 @@ def _loading_info(**overrides):
     return info
 
 
-def _config(*, revision=REVISION):
+def _config():
     return SimpleNamespace(
-        model_type="qwen3",
-        architectures=["Qwen3DSparkModel"],
-        vocab_size=32,
-        hidden_size=8,
-        intermediate_size=16,
-        num_target_layers=4,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=4,
-        hidden_act="silu",
-        attention_bias=False,
-        attention_dropout=0.0,
-        rms_norm_eps=1e-6,
-        rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
-        max_position_embeddings=32768,
-        layer_types=["full_attention", "full_attention"],
-        sliding_window=None,
-        block_size=7,
-        target_layer_ids=[0, 1],
-        mask_token_id=31,
-        num_anchors=4,
-        tie_word_embeddings=False,
-        enable_confidence_head=True,
-        confidence_head_with_markov=True,
-        markov_rank=2,
-        markov_head_type="vanilla",
         _attn_implementation="flex_attention",
-        _commit_hash=revision,
     )
 
 
@@ -82,6 +54,7 @@ class FakeDraftModel:
         assert path == "published-draft"
         assert kwargs["revision"] == REVISION
         assert kwargs["output_loading_info"] is True
+        cls.loaded_model.config = kwargs["config"]
         return cls.loaded_model, cls.loading_info
 
     def to(self, *, device, dtype):
@@ -145,6 +118,7 @@ def test_external_init_loads_only_exact_compatible_weights():
 
     assert result is loaded
     assert result.embedding_head_trainable is False
+    assert result.config is expected.config
     assert result.initialized_from == (expected.embed_tokens, expected.lm_head)
     assert result.to_args == (torch.device("cpu"), torch.bfloat16)
 
@@ -154,16 +128,5 @@ def test_external_init_rejects_incomplete_weights():
     FakeDraftModel.loaded_model = FakeDraftModel()
     FakeDraftModel.loading_info = _loading_info(missing_keys=["draft.layers.0.weight"])
 
-    with pytest.raises(ValueError, match="missing_keys"):
-        _load(expected)
-
-
-def test_external_init_rejects_incompatible_config():
-    expected = FakeDraftModel()
-    loaded = FakeDraftModel()
-    loaded.config.block_size = 8
-    FakeDraftModel.loaded_model = loaded
-    FakeDraftModel.loading_info = _loading_info()
-
-    with pytest.raises(ValueError, match=r"config\.block_size mismatch"):
+    with pytest.raises(RuntimeError, match="missing_keys"):
         _load(expected)

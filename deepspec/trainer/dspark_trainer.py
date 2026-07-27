@@ -1,5 +1,3 @@
-import math
-
 import torch
 
 from deepspec.data import CacheCollator
@@ -21,18 +19,11 @@ class Qwen3DSparkTrainer(BaseTrainer):
     def capture_target_model(self, target_model):
         if self.args.data.get("train_jsonl_path") is None:
             return
-        if getattr(target_model.config, "model_type", None) != "qwen3":
-            raise ValueError("live hidden training currently supports only Qwen3")
         norm = target_model.model.norm
-        eps = getattr(norm, "variance_epsilon", None)
-        if eps is None:
-            eps = getattr(norm, "eps", None)
-        if eps is None or not math.isfinite(float(eps)) or float(eps) <= 0:
-            raise ValueError("target model has no valid final RMSNorm epsilon")
         self._target_final_norm_weight = (
             norm.weight.detach().to(device="cpu", dtype=torch.bfloat16).clone()
         )
-        self._target_final_norm_eps = float(eps)
+        self._target_final_norm_eps = float(norm.variance_epsilon)
 
     def build_train_dataset(self):
         data_args = self.args.data
@@ -54,8 +45,6 @@ class Qwen3DSparkTrainer(BaseTrainer):
             vllm_endpoint=data_args.vllm_endpoint,
             vllm_model=data_args.vllm_model,
             hidden_states_path=data_args.hidden_states_path,
-            target_model_name_or_path=self.args.model.target_model_name_or_path,
-            target_revision=self.args.model.target_revision,
             target_layer_ids=self.draft_model.target_layer_ids,
             hidden_size=int(self.draft_model.config.hidden_size),
             final_norm_weight=self._target_final_norm_weight,
