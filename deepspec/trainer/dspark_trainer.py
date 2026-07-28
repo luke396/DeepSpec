@@ -1,3 +1,5 @@
+import torch
+
 from deepspec.data import CacheCollator
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.gemma4.config import (
@@ -13,6 +15,42 @@ from deepspec.trainer.base_trainer import BaseTrainer
 
 class Qwen3DSparkTrainer(BaseTrainer):
     data_collator_cls = CacheCollator
+
+    def capture_target_model(self, target_model):
+        if self.args.data.get("train_jsonl_path") is None:
+            return
+        norm = target_model.model.norm
+        self._target_final_norm_weight = (
+            norm.weight.detach().to(device="cpu", dtype=torch.bfloat16).clone()
+        )
+        self._target_final_norm_eps = float(norm.variance_epsilon)
+
+    def build_train_dataset(self):
+        data_args = self.args.data
+        train_jsonl_path = data_args.get("train_jsonl_path")
+        if train_jsonl_path is None:
+            return super().build_train_dataset()
+        if data_args.get("target_cache_path") is not None:
+            raise ValueError(
+                "train_jsonl_path and target_cache_path are mutually exclusive"
+            )
+        from deepspec.data.live_hidden_dataset import LiveHiddenDataset
+
+        return LiveHiddenDataset(
+            data_path=train_jsonl_path,
+            tokenizer=self.tokenizer,
+            chat_template=data_args.chat_template,
+            max_length=int(data_args.max_length),
+            min_loss_tokens=int(data_args.min_loss_tokens),
+            vllm_endpoint=data_args.vllm_endpoint,
+            vllm_model=data_args.vllm_model,
+            hidden_states_path=data_args.hidden_states_path,
+            target_layer_ids=self.draft_model.target_layer_ids,
+            hidden_size=int(self.draft_model.config.hidden_size),
+            final_norm_weight=self._target_final_norm_weight,
+            final_norm_eps=self._target_final_norm_eps,
+            expected_num_samples=data_args.expected_num_samples,
+        )
 
     def _build_draft_model(self, *, target_config, model_args):
         draft_config = build_qwen3_draft_config(

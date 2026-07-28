@@ -23,9 +23,11 @@ from deepspec.utils import (
 )
 from deepspec.trainer.ckpt_manager import (
     discover_latest_checkpoint,
+    load_external_draft_model,
     load_resume_draft_model,
     load_training_state,
     save_checkpoint,
+    select_draft_initialization,
 )
 import deepspec.utils.training_logger as training_logger
 from deepspec.utils.hfai_suspend import SuspendController
@@ -173,7 +175,12 @@ class BaseTrainer:
         )
 
         self.draft_model, self.tokenizer = self.build_models()
-        if self.resume_checkpoint_dir is not None:
+        initialization = select_draft_initialization(
+            resume_checkpoint_dir=self.resume_checkpoint_dir,
+            init_name_or_path=self.args.model.get("init_draft_name_or_path"),
+            init_revision=self.args.model.get("init_draft_revision"),
+        )
+        if initialization == "resume":
             self.draft_model = load_resume_draft_model(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
                 draft_model=self.draft_model,
@@ -181,18 +188,25 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
+        elif initialization == "external":
+            self.draft_model = load_external_draft_model(
+                init_name_or_path=self.args.model.init_draft_name_or_path,
+                init_revision=self.args.model.init_draft_revision,
+                draft_model=self.draft_model,
+                device=self.device,
+                precision_dtype=self.precision_dtype,
+            )
+            print_on_local_main(
+                "Starting a fresh stage from external draft weights; "
+                "optimizer, scheduler, step, RNG, and sampler state are fresh."
+            )
         self.model = self.draft_model
         if self.args.train.torch_compile:
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
 
-        self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
-        validate_train_cache(
-            train_dataset=self.train_dataset,
-            draft_model=self.draft_model,
-            target_model_name_or_path=self.args.model.target_model_name_or_path,
-        )
+        self.train_dataset = self.build_train_dataset()
 
         (
             self.gradient_accumulation_steps,
@@ -218,7 +232,7 @@ class BaseTrainer:
             warmup_ratio=float(self.args.train.warmup_ratio),
             weight_decay=float(self.args.train.weight_decay),
         )
-        if self.resume_checkpoint_dir is not None:
+        if initialization == "resume":
             resume_state = load_training_state(
                 resume_checkpoint_dir=self.resume_checkpoint_dir,
                 optimizer=self.optimizer,
@@ -229,9 +243,18 @@ class BaseTrainer:
                 micro_batches_per_epoch=self.micro_batches_per_epoch,
             )
             self.next_micro_step = resume_state.next_micro_step
-        else:
+        elif initialization == "scratch":
             print_on_local_main("Training from scratch.")
         self.info_board()
+
+    def build_train_dataset(self):
+        train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
+        validate_train_cache(
+            train_dataset=train_dataset,
+            draft_model=self.draft_model,
+            target_model_name_or_path=self.args.model.target_model_name_or_path,
+        )
+        return train_dataset
 
     @property
     def global_step(self):
@@ -250,12 +273,17 @@ class BaseTrainer:
 
     def build_models(self):
         model_args = self.args.model
+        revision_kwargs = {}
+        if model_args.get("target_revision") is not None:
+            revision_kwargs["revision"] = model_args.target_revision
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.target_model_name_or_path,
+            **revision_kwargs,
         )
         target_config = AutoConfig.from_pretrained(
             model_args.target_model_name_or_path,
+            **revision_kwargs,
         )
 
         draft_model = self._build_draft_model(
@@ -269,7 +297,9 @@ class BaseTrainer:
         target_model = AutoModelForCausalLM.from_pretrained(
             model_args.target_model_name_or_path,
             dtype=self.precision_dtype,
+            **revision_kwargs,
         ).to(device="cpu").eval()
+        self.capture_target_model(target_model)
         target_embed_tokens = target_model.get_input_embeddings()
         target_lm_head = target_model.get_output_embeddings()
         assert (target_lm_head is not None) and (target_embed_tokens is not None)
@@ -280,6 +310,9 @@ class BaseTrainer:
         )
         del target_model
         return draft_model, tokenizer
+
+    def capture_target_model(self, target_model):
+        return None
 
     def _build_draft_model(self, *, target_config, model_args):
         raise NotImplementedError
@@ -367,6 +400,7 @@ class BaseTrainer:
             num_samples=remaining_samples,
         )
         prefetcher = CUDAPrefetcher(dataloader, self.device)
+        checkpointing_steps = int(self.args.logging.checkpointing_steps)
         training_logger.start_session(global_step=self.global_step)
 
         with self.suspend_controller.monitoring():
@@ -397,14 +431,15 @@ class BaseTrainer:
                     grad_norm=grad_norm.item(),
                 )
 
-                if self.global_step % int(self.args.logging.checkpointing_steps) == 0:
+                if self.global_step % checkpointing_steps == 0:
                     self.save_and_eval_checkpoint()
 
                 if self.suspend_controller.requested():
                     self._save_and_suspend()
                     return
 
-        self.save_and_eval_checkpoint()
+        if self.global_step % checkpointing_steps != 0:
+            self.save_and_eval_checkpoint()
 
     def clean_up(self):
         training_logger.close()

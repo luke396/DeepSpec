@@ -29,6 +29,64 @@ def discover_latest_checkpoint(checkpoint_dir):
     return os.path.realpath(latest_link)
 
 
+def select_draft_initialization(
+    *,
+    resume_checkpoint_dir: str | None,
+    init_name_or_path: str | None,
+    init_revision: str | None,
+) -> str:
+    if resume_checkpoint_dir is not None:
+        return "resume"
+    has_path = init_name_or_path is not None
+    has_revision = init_revision is not None
+    if has_path != has_revision:
+        raise ValueError(
+            "external draft init requires both init_draft_name_or_path and "
+            "init_draft_revision"
+        )
+    return "external" if has_path else "scratch"
+
+
+def load_external_draft_model(
+    *,
+    init_name_or_path: str,
+    init_revision: str,
+    draft_model,
+    device,
+    precision_dtype,
+):
+    loaded_model, loading_info = type(draft_model).from_pretrained(
+        init_name_or_path,
+        revision=init_revision,
+        config=draft_model.config,
+        dtype=precision_dtype,
+        attn_implementation=str(draft_model.config._attn_implementation),
+        output_loading_info=True,
+    )
+    loading_errors = {
+        field: loading_info[field]
+        for field in (
+            "missing_keys",
+            "unexpected_keys",
+            "mismatched_keys",
+            "error_msgs",
+        )
+        if loading_info.get(field)
+    }
+    if loading_errors:
+        raise RuntimeError(
+            "external draft weights do not match the expected architecture: "
+            f"{loading_errors}"
+        )
+    loaded_model = loaded_model.to(device=device, dtype=precision_dtype)
+    loaded_model.initialize_embeddings_and_head(
+        embed_tokens=draft_model.embed_tokens,
+        lm_head=draft_model.lm_head,
+        freeze=True,
+    )
+    return loaded_model
+
+
 def save_train_config(*, train_config, checkpoint_dir: str) -> str:
     dest_path = os.path.join(checkpoint_dir, TRAIN_CONFIG_FILE_NAME)
     if not is_global_main_process():
