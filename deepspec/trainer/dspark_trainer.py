@@ -1,7 +1,7 @@
 import torch
 
 from deepspec.data import CacheCollator
-from deepspec.data.live_hidden_prefilter import (
+from deepspec.data.live_hidden_data import (
     load_prepared_live_hidden_metadata,
     validate_prepared_live_hidden_data,
 )

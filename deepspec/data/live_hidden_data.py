@@ -1,4 +1,4 @@
-"""Prepare and validate train-ready JSONL for live hidden-state training."""
+"""Prepare and validate the train-ready data contract for live-hidden training."""
 
 import hashlib
 import json
