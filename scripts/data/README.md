@@ -102,30 +102,44 @@ Stop the sglang servers before the next step if they are using the same GPUs.
 
 ## Alternative: Live Hidden-State Training
 
-DSpark can consume the regenerated JSONL directly by setting
-`data.train_jsonl_path` and requesting target hidden states during training.
-This path does not build the large target cache described below.
+DSpark can request target hidden states during training instead of building the
+large target cache described below. First materialize a train-ready JSONL:
 
-Before the training schedule and sampler are created, DeepSpec tokenizes every
-source row with the configured target tokenizer, chat template, `max_length`,
-and `min_loss_tokens`. Rows that cannot provide enough supervised tokens after
-truncation are excluded from the dataset view, so they cannot terminate a
-training run later.
+```bash
+python scripts/data/prepare_live_hidden_data.py \
+    --input-file-path train_datasets/qwen3_4b/perfectblend_train_regen.jsonl \
+    --output-file-path train_datasets/qwen3_4b/perfectblend_train_ready.jsonl \
+    --artifact-dir train_datasets/qwen3_4b/perfectblend_train_filter \
+    --target-model-name-or-path Qwen/Qwen3-4B \
+    --chat-template qwen \
+    --max-length 4096 \
+    --min-loss-tokens 14
+```
 
-The source JSONL remains the only copy of the conversation text. DeepSpec writes
-only two small artifacts under the experiment checkpoint directory:
+The command tokenizes every source row with the configured target tokenizer,
+chat template, `max_length`, and `min_loss_tokens`. It writes accepted rows
+byte-for-byte and in source order to the output JSONL. Rows that cannot provide
+enough supervised tokens after truncation, or cannot be parsed and rendered,
+are excluded before training.
+
+The preparation produces:
 
 ```text
-live_hidden_prefilter/rejected.jsonl
-live_hidden_prefilter/manifest.json
+perfectblend_train_ready.jsonl
+perfectblend_train_filter/rejected.jsonl
+perfectblend_train_filter/manifest.json
 ```
 
 Each rejected entry contains its zero-based `source_index`, optional source
 `id`, rejection reason, and token counts. It does not copy the conversation.
-The manifest records the source SHA256, target/tokenizer identity, filtering
-parameters, and source/accepted/rejected counts. `LiveHiddenDataset` derives the
-accepted view as `source - rejected`, preserving source order without writing a
-second accepted JSONL.
+The manifest records input and filtered SHA256 values, target/tokenizer
+identity, filtering parameters, and source/accepted/rejected counts.
+
+Set `data.train_jsonl_path` to the filtered JSONL and
+`data.train_manifest_path` to its manifest. Trainer startup validates the
+filtered file, rejected index, tokenizer, and preprocessing contract, then
+derives the schedule from the filtered row count. It does not repeat the full
+tokenizer scan.
 
 ## Step 3: Prepare Target Cache
 

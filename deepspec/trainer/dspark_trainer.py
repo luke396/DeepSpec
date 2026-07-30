@@ -1,11 +1,9 @@
-from pathlib import Path
-
 import torch
 
 from deepspec.data import CacheCollator
 from deepspec.data.live_hidden_prefilter import (
-    load_live_hidden_prefilter,
-    prepare_live_hidden_prefilter,
+    load_prepared_live_hidden_metadata,
+    validate_prepared_live_hidden_data,
 )
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.gemma4.config import (
@@ -40,30 +38,35 @@ class Qwen3DSparkTrainer(BaseTrainer):
             raise ValueError(
                 "train_jsonl_path and target_cache_path are mutually exclusive"
             )
+        train_manifest_path = data_args.get("train_manifest_path")
+        if train_manifest_path is None:
+            raise ValueError(
+                "live hidden training requires data.train_manifest_path"
+            )
         from deepspec.data.live_hidden_dataset import LiveHiddenDataset
 
-        prefilter_dir = Path(self.checkpoint_dir_root) / "live_hidden_prefilter"
         if self.global_rank == 0:
-            prefilter = prepare_live_hidden_prefilter(
-                source_path=train_jsonl_path,
-                output_dir=prefilter_dir,
+            prepared = validate_prepared_live_hidden_data(
+                manifest_path=train_manifest_path,
+                filtered_path=train_jsonl_path,
                 tokenizer=self.tokenizer,
                 chat_template=data_args.chat_template,
                 max_length=int(data_args.max_length),
                 min_loss_tokens=int(data_args.min_loss_tokens),
-                expected_num_samples=data_args.get("expected_num_samples"),
                 target_model_name_or_path=self.args.model.target_model_name_or_path,
                 target_revision=self.args.model.get("target_revision"),
-                replace_existing=self.resume_checkpoint_dir is None,
             )
             print(
-                "Live hidden prefilter: "
-                f"{prefilter.accepted_samples}/{prefilter.source_samples} accepted, "
-                f"{prefilter.rejected_samples} rejected -> {prefilter.rejected_path}",
+                "Prepared live hidden data: "
+                f"{prepared.accepted_samples}/{prepared.source_samples} accepted, "
+                f"{prepared.rejected_samples} rejected -> {prepared.filtered_path}",
                 flush=True,
             )
         torch.distributed.barrier()
-        prefilter = load_live_hidden_prefilter(prefilter_dir)
+        prepared = load_prepared_live_hidden_metadata(
+            manifest_path=train_manifest_path,
+            filtered_path=train_jsonl_path,
+        )
 
         return LiveHiddenDataset(
             data_path=train_jsonl_path,
@@ -78,8 +81,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
             hidden_size=int(self.draft_model.config.hidden_size),
             final_norm_weight=self._target_final_norm_weight,
             final_norm_eps=self._target_final_norm_eps,
-            expected_num_samples=data_args.expected_num_samples,
-            rejected_indices=prefilter.rejected_indices,
+            expected_num_samples=prepared.accepted_samples,
         )
 
     def _build_draft_model(self, *, target_config, model_args):

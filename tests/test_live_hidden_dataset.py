@@ -14,8 +14,8 @@ import deepspec.data.live_hidden_dataset as live_module
 import deepspec.data.jsonl_dataset as jsonl_module
 from deepspec.data.live_hidden_dataset import LiveHiddenDataset
 from deepspec.data.live_hidden_prefilter import (
-    map_live_hidden_index,
-    prepare_live_hidden_prefilter,
+    prepare_live_hidden_data,
+    validate_prepared_live_hidden_data,
 )
 from deepspec.utils.config import ConfigNode
 
@@ -285,11 +285,13 @@ def test_vllm_model_identity_mismatch_fails_before_hidden_request(
     assert completions.calls == []
 
 
-def test_live_prefilter_excludes_rejections_without_copying_conversations(
+def test_live_preparation_materializes_trainable_rows_and_minimal_rejections(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(jsonl_module, "CACHE_DIR", str(tmp_path / "index-cache"))
-    data_path = tmp_path / "regen.canonical.jsonl"
+    source_path = tmp_path / "regen.unfiltered.jsonl"
+    filtered_path = tmp_path / "regen.canonical.jsonl"
+    artifact_dir = tmp_path / "filter"
     rows = [
         {
             "id": "accepted",
@@ -312,11 +314,13 @@ def test_live_prefilter_excludes_rejections_without_copying_conversations(
             ],
         },
     ]
-    _write_rows(data_path, rows)
+    _write_rows(source_path, rows)
+    accepted_line = source_path.read_bytes().splitlines(keepends=True)[0]
 
-    prefilter = prepare_live_hidden_prefilter(
-        source_path=data_path,
-        output_dir=tmp_path / "prefilter",
+    prepared = prepare_live_hidden_data(
+        source_path=source_path,
+        filtered_path=filtered_path,
+        artifact_dir=artifact_dir,
         tokenizer=FakeTokenizer(),
         chat_template="qwen",
         max_length=200,
@@ -324,20 +328,20 @@ def test_live_prefilter_excludes_rejections_without_copying_conversations(
         expected_num_samples=3,
         target_model_name_or_path="Qwen/Qwen3-8B",
         target_revision="b" * 40,
-        replace_existing=True,
     )
 
-    assert prefilter.source_samples == 3
-    assert prefilter.accepted_samples == 1
-    assert prefilter.rejected_samples == 2
-    assert prefilter.rejected_indices == (1, 2)
-    assert {path.name for path in (tmp_path / "prefilter").iterdir()} == {
+    assert prepared.source_samples == 3
+    assert prepared.accepted_samples == 1
+    assert prepared.rejected_samples == 2
+    assert prepared.rejected_indices == (1, 2)
+    assert filtered_path.read_bytes() == accepted_line
+    assert {path.name for path in artifact_dir.iterdir()} == {
         "manifest.json",
         "rejected.jsonl",
     }
     rejected = [
         json.loads(line)
-        for line in prefilter.rejected_path.read_text(encoding="utf-8").splitlines()
+        for line in prepared.rejected_path.read_text(encoding="utf-8").splitlines()
     ]
     assert [item["id"] for item in rejected] == [
         "reject-no-answer",
@@ -355,7 +359,7 @@ def test_live_prefilter_excludes_rejections_without_copying_conversations(
         }
         for item in rejected
     )
-    rejected_text = prefilter.rejected_path.read_text(encoding="utf-8")
+    rejected_text = prepared.rejected_path.read_text(encoding="utf-8")
     assert "private user-only content" not in rejected_text
     assert "private long prompt" not in rejected_text
 
@@ -365,7 +369,7 @@ def test_live_prefilter_excludes_rejections_without_copying_conversations(
     fake_client = FakeOpenAI(completions)
     monkeypatch.setattr(live_module.openai, "OpenAI", lambda **_: fake_client)
     dataset = LiveHiddenDataset(
-        data_path=data_path,
+        data_path=filtered_path,
         tokenizer=FakeTokenizer(),
         chat_template="qwen",
         max_length=200,
@@ -377,40 +381,23 @@ def test_live_prefilter_excludes_rejections_without_copying_conversations(
         hidden_size=8,
         final_norm_weight=NORM_WEIGHT,
         final_norm_eps=1e-6,
-        expected_num_samples=3,
-        rejected_indices=prefilter.rejected_indices,
+        expected_num_samples=1,
     )
 
     assert len(dataset) == 1
-    assert dataset._source_index(0) == 0
     assert dataset[0]["loss_mask"].sum().item() >= 1
     assert len(completions.calls) == 1
 
 
-@pytest.mark.parametrize(
-    ("index", "expected_source_index"),
-    [(0, 1), (1, 3), (2, 4), (3, 6)],
-)
-def test_live_prefilter_maps_logical_indices_around_rejections(
-    index, expected_source_index
-):
-    assert (
-        map_live_hidden_index(
-            index,
-            source_samples=7,
-            rejected_indices=(0, 2, 5),
-        )
-        == expected_source_index
-    )
-
-
-def test_live_prefilter_rejects_resume_artifact_drift(tmp_path):
-    data_path = tmp_path / "regen.canonical.jsonl"
-    _write_dataset(data_path)
-    output_dir = tmp_path / "prefilter"
+def test_prepared_live_hidden_validation_rejects_filtered_content_drift(tmp_path):
+    source_path = tmp_path / "regen.unfiltered.jsonl"
+    filtered_path = tmp_path / "regen.canonical.jsonl"
+    _write_dataset(source_path)
+    artifact_dir = tmp_path / "filter"
     kwargs = dict(
-        source_path=data_path,
-        output_dir=output_dir,
+        source_path=source_path,
+        filtered_path=filtered_path,
+        artifact_dir=artifact_dir,
         tokenizer=FakeTokenizer(),
         chat_template="qwen",
         max_length=32768,
@@ -419,53 +406,63 @@ def test_live_prefilter_rejects_resume_artifact_drift(tmp_path):
         target_model_name_or_path="Qwen/Qwen3-8B",
         target_revision="b" * 40,
     )
-    prepare_live_hidden_prefilter(replace_existing=True, **kwargs)
+    prepared = prepare_live_hidden_data(**kwargs)
 
-    _write_rows(
-        data_path,
-        [
-            {
-                "id": "changed",
-                "conversations": [
-                    {"role": "user", "content": "changed question"},
-                    {"role": "assistant", "content": "changed answer"},
-                ],
-            }
-        ],
-    )
+    filtered_path.write_bytes(filtered_path.read_bytes() + b" ")
 
-    with pytest.raises(ValueError, match="no longer matches"):
-        prepare_live_hidden_prefilter(replace_existing=False, **kwargs)
-
-
-def test_live_prefilter_requires_existing_artifacts_on_resume(tmp_path):
-    data_path = tmp_path / "regen.canonical.jsonl"
-    _write_dataset(data_path)
-
-    with pytest.raises(ValueError, match="requires its existing"):
-        prepare_live_hidden_prefilter(
-            source_path=data_path,
-            output_dir=tmp_path / "missing-prefilter",
+    with pytest.raises(ValueError, match="JSONL checksum mismatch"):
+        validate_prepared_live_hidden_data(
+            manifest_path=prepared.manifest_path,
+            filtered_path=filtered_path,
             tokenizer=FakeTokenizer(),
             chat_template="qwen",
             max_length=32768,
             min_loss_tokens=1,
-            expected_num_samples=1,
             target_model_name_or_path="Qwen/Qwen3-8B",
             target_revision="b" * 40,
-            replace_existing=False,
         )
 
 
-def test_dspark_trainer_prefilters_before_building_training_schedule(
+def test_prepared_live_hidden_validation_rejects_training_contract_drift(tmp_path):
+    source_path = tmp_path / "regen.unfiltered.jsonl"
+    filtered_path = tmp_path / "regen.canonical.jsonl"
+    _write_dataset(source_path)
+    prepared = prepare_live_hidden_data(
+        source_path=source_path,
+        filtered_path=filtered_path,
+        artifact_dir=tmp_path / "filter",
+        tokenizer=FakeTokenizer(),
+        chat_template="qwen",
+        max_length=32768,
+        min_loss_tokens=1,
+        expected_num_samples=1,
+        target_model_name_or_path="Qwen/Qwen3-8B",
+        target_revision="b" * 40,
+    )
+
+    with pytest.raises(ValueError, match="max_length mismatch"):
+        validate_prepared_live_hidden_data(
+            manifest_path=prepared.manifest_path,
+            filtered_path=filtered_path,
+            tokenizer=FakeTokenizer(),
+            chat_template="qwen",
+            max_length=4096,
+            min_loss_tokens=1,
+            target_model_name_or_path="Qwen/Qwen3-8B",
+            target_revision="b" * 40,
+        )
+
+
+def test_dspark_trainer_consumes_prepared_jsonl_without_full_prefilter(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(jsonl_module, "CACHE_DIR", str(tmp_path / "index-cache"))
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
     trainer_cls = _load_dspark_trainer(monkeypatch)
+    source_path = tmp_path / "regen.unfiltered.jsonl"
     data_path = tmp_path / "regen.canonical.jsonl"
     _write_rows(
-        data_path,
+        source_path,
         [
             {
                 "id": "accepted",
@@ -482,6 +479,18 @@ def test_dspark_trainer_prefilters_before_building_training_schedule(
             },
         ],
     )
+    prepared = prepare_live_hidden_data(
+        source_path=source_path,
+        filtered_path=data_path,
+        artifact_dir=tmp_path / "filter",
+        tokenizer=FakeTokenizer(),
+        chat_template="qwen",
+        max_length=32768,
+        min_loss_tokens=1,
+        expected_num_samples=2,
+        target_model_name_or_path="Qwen/Qwen3-8B",
+        target_revision="b" * 40,
+    )
     hidden_dir = tmp_path / "hidden"
     hidden_dir.mkdir()
 
@@ -497,10 +506,10 @@ def test_dspark_trainer_prefilters_before_building_training_schedule(
             {
                 "target_cache_path": None,
                 "train_jsonl_path": str(data_path),
+                "train_manifest_path": str(prepared.manifest_path),
                 "vllm_endpoint": "http://hidden-router:8000/v1",
                 "vllm_model": "Qwen/Qwen3-8B",
                 "hidden_states_path": str(hidden_dir),
-                "expected_num_samples": 2,
                 "chat_template": "qwen",
                 "max_length": 32768,
                 "min_loss_tokens": 1,
@@ -520,6 +529,5 @@ def test_dspark_trainer_prefilters_before_building_training_schedule(
 
     dataset = trainer.build_train_dataset()
 
-    assert len(dataset.dataset) == 2
+    assert len(dataset.dataset) == 1
     assert len(dataset) == 1
-    assert dataset.rejected_indices == (1,)

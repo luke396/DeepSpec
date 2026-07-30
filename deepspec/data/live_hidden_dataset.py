@@ -8,7 +8,6 @@ import torch
 from safetensors.torch import load_file
 
 from deepspec.data.jsonl_dataset import JsonLineDataset
-from deepspec.data.live_hidden_prefilter import map_live_hidden_index
 from deepspec.data.target_cache_dataset import ConversationCollator
 
 
@@ -56,7 +55,6 @@ class LiveHiddenDataset(torch.utils.data.Dataset):
         final_norm_weight: torch.Tensor,
         final_norm_eps: float,
         expected_num_samples: int | None,
-        rejected_indices=(),
     ):
         data_path = Path(data_path)
         self.max_length = int(max_length)
@@ -84,25 +82,9 @@ class LiveHiddenDataset(torch.utils.data.Dataset):
                 "live dataset sample count mismatch: "
                 f"{len(self.dataset)} != {int(expected_num_samples)}"
             )
-        self.rejected_indices = tuple(int(index) for index in rejected_indices)
-        if (
-            self.rejected_indices != tuple(sorted(set(self.rejected_indices)))
-            or any(
-                index < 0 or index >= len(self.dataset)
-                for index in self.rejected_indices
-            )
-        ):
-            raise ValueError("invalid live hidden rejected indices")
 
     def __len__(self):
-        return len(self.dataset) - len(self.rejected_indices)
-
-    def _source_index(self, index):
-        return map_live_hidden_index(
-            index,
-            source_samples=len(self.dataset),
-            rejected_indices=self.rejected_indices,
-        )
+        return len(self.dataset)
 
     def _setup_client(self):
         client = openai.OpenAI(
@@ -184,12 +166,11 @@ class LiveHiddenDataset(torch.utils.data.Dataset):
         )
 
     def __getitem__(self, index):
-        source_index = self._source_index(index)
-        batch = self._token_collator([self.dataset[source_index]])
+        batch = self._token_collator([self.dataset[index]])
         if batch is None:
             raise RuntimeError(
-                "live hidden prefilter contract changed for source sample "
-                f"{source_index}"
+                "prepared live hidden data contract changed for sample "
+                f"{index}"
             )
         input_ids = batch["input_ids"][0]
         loss_mask = batch["loss_mask"][0]

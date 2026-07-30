@@ -1,23 +1,23 @@
-"""Tokenizer-only prefilter artifacts for live hidden-state training."""
+"""Prepare and validate train-ready JSONL for live hidden-state training."""
 
 import hashlib
 import json
 import os
-from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
 from deepspec.data.parser import preprocess_record
 
 
-LIVE_HIDDEN_PREFILTER_VERSION = 1
+LIVE_HIDDEN_DATA_VERSION = 1
 REJECTED_FILE_NAME = "rejected.jsonl"
 MANIFEST_FILE_NAME = "manifest.json"
 
 
 @dataclass(frozen=True)
-class LiveHiddenPrefilter:
+class PreparedLiveHiddenData:
     manifest_path: Path
+    filtered_path: Path
     rejected_path: Path
     source_samples: int
     accepted_samples: int
@@ -31,6 +31,16 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_file_and_count_lines(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    count = 0
+    with path.open("rb") as handle:
+        for line in handle:
+            digest.update(line)
+            count += 1
+    return digest.hexdigest(), count
 
 
 def _json_line(payload) -> bytes:
@@ -94,6 +104,15 @@ def _atomic_json_dump(payload, path: Path) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
+def _record_id(record):
+    if not isinstance(record, dict):
+        return None
+    value = record.get("id")
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def _rejection(
     *,
     source_index: int,
@@ -105,9 +124,10 @@ def _rejection(
 ):
     payload = {
         "source_index": int(source_index),
-        "id": record_id,
         "reason": reason,
     }
+    if record_id is not None:
+        payload["id"] = record_id
     if sequence_tokens is not None:
         payload["sequence_tokens"] = int(sequence_tokens)
     if loss_tokens is not None:
@@ -117,26 +137,32 @@ def _rejection(
     return payload
 
 
-def _existing_prefilter_matches(
-    *, manifest_path: Path, rejected_path: Path, expected_manifest
-) -> bool:
-    if not manifest_path.is_file() or not rejected_path.is_file():
-        return False
-    try:
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        manifest == expected_manifest
-        and _sha256_file(rejected_path) == expected_manifest["rejected_sha256"]
-    )
+def _training_contract(
+    *,
+    tokenizer,
+    chat_template: str,
+    max_length: int,
+    min_loss_tokens: int,
+    target_model_name_or_path: str,
+    target_revision: str | None,
+):
+    return {
+        "target_model_name_or_path": str(target_model_name_or_path),
+        "target_revision": (
+            str(target_revision) if target_revision is not None else None
+        ),
+        "tokenizer": _tokenizer_identity(tokenizer),
+        "chat_template": str(chat_template),
+        "max_length": int(max_length),
+        "min_loss_tokens": int(min_loss_tokens),
+    }
 
 
-def prepare_live_hidden_prefilter(
+def prepare_live_hidden_data(
     *,
     source_path,
-    output_dir,
+    filtered_path,
+    artifact_dir,
     tokenizer,
     chat_template: str,
     max_length: int,
@@ -144,23 +170,28 @@ def prepare_live_hidden_prefilter(
     expected_num_samples: int | None,
     target_model_name_or_path: str,
     target_revision: str | None,
-    replace_existing: bool,
-) -> LiveHiddenPrefilter:
+    replace_existing: bool = False,
+) -> PreparedLiveHiddenData:
     source_path = Path(source_path).resolve(strict=True)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rejected_path = output_dir / REJECTED_FILE_NAME
-    manifest_path = output_dir / MANIFEST_FILE_NAME
-    rejected_tmp_path = output_dir / f".{REJECTED_FILE_NAME}.tmp-{os.getpid()}"
+    filtered_path = Path(filtered_path).resolve(strict=False)
+    artifact_dir = Path(artifact_dir).resolve(strict=False)
+    if source_path == filtered_path:
+        raise ValueError("source and filtered JSONL paths must be different")
 
-    if not replace_existing and (
-        not manifest_path.is_file() or not rejected_path.is_file()
-    ):
-        raise ValueError(
-            "resumed live hidden training requires its existing prefilter artifacts"
-        )
+    filtered_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    rejected_path = artifact_dir / REJECTED_FILE_NAME
+    manifest_path = artifact_dir / MANIFEST_FILE_NAME
+    output_paths = (filtered_path, rejected_path, manifest_path)
+    if not replace_existing and any(path.exists() for path in output_paths):
+        raise FileExistsError("prepared live hidden output already exists")
 
+    filtered_tmp_path = filtered_path.with_name(
+        f".{filtered_path.name}.tmp-{os.getpid()}"
+    )
+    rejected_tmp_path = artifact_dir / f".{REJECTED_FILE_NAME}.tmp-{os.getpid()}"
     source_digest = hashlib.sha256()
+    filtered_digest = hashlib.sha256()
     rejected_digest = hashlib.sha256()
     source_samples = 0
     rejected_samples = 0
@@ -168,6 +199,7 @@ def prepare_live_hidden_prefilter(
     try:
         with (
             source_path.open("rb") as source_handle,
+            filtered_tmp_path.open("wb") as filtered_handle,
             rejected_tmp_path.open("wb") as rejected_handle,
         ):
             for source_index, raw_line in enumerate(source_handle):
@@ -179,8 +211,7 @@ def prepare_live_hidden_prefilter(
 
                 try:
                     record = json.loads(raw_line.decode("utf-8"))
-                    if isinstance(record, dict):
-                        record_id = record.get("id")
+                    record_id = _record_id(record)
                 except UnicodeDecodeError as exc:
                     rejection = _rejection(
                         source_index=source_index,
@@ -223,14 +254,18 @@ def prepare_live_hidden_prefilter(
                                 loss_tokens=loss_tokens,
                             )
 
-                if rejection is not None:
+                if rejection is None:
+                    filtered_handle.write(raw_line)
+                    filtered_digest.update(raw_line)
+                else:
                     encoded = _json_line(rejection)
                     rejected_handle.write(encoded)
                     rejected_digest.update(encoded)
                     rejected_samples += 1
 
-            rejected_handle.flush()
-            os.fsync(rejected_handle.fileno())
+            for handle in (filtered_handle, rejected_handle):
+                handle.flush()
+                os.fsync(handle.fileno())
 
         if expected_num_samples is not None and source_samples != int(
             expected_num_samples
@@ -242,106 +277,138 @@ def prepare_live_hidden_prefilter(
 
         accepted_samples = source_samples - rejected_samples
         if accepted_samples <= 0:
-            raise ValueError("live hidden prefilter found no trainable samples")
+            raise ValueError("live hidden preparation found no trainable samples")
 
         manifest = {
-            "version": LIVE_HIDDEN_PREFILTER_VERSION,
-            "source_jsonl_path": str(source_path),
+            "version": LIVE_HIDDEN_DATA_VERSION,
+            "source_file": source_path.name,
             "source_sha256": source_digest.hexdigest(),
             "source_samples": source_samples,
+            "filtered_file": filtered_path.name,
+            "filtered_sha256": filtered_digest.hexdigest(),
             "accepted_samples": accepted_samples,
-            "rejected_samples": rejected_samples,
             "rejected_file": REJECTED_FILE_NAME,
             "rejected_sha256": rejected_digest.hexdigest(),
-            "target_model_name_or_path": str(target_model_name_or_path),
-            "target_revision": target_revision,
-            "tokenizer": _tokenizer_identity(tokenizer),
-            "chat_template": str(chat_template),
-            "max_length": int(max_length),
-            "min_loss_tokens": int(min_loss_tokens),
+            "rejected_samples": rejected_samples,
+            **_training_contract(
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                max_length=max_length,
+                min_loss_tokens=min_loss_tokens,
+                target_model_name_or_path=target_model_name_or_path,
+                target_revision=target_revision,
+            ),
         }
 
-        if _existing_prefilter_matches(
-            manifest_path=manifest_path,
-            rejected_path=rejected_path,
-            expected_manifest=manifest,
-        ):
-            return load_live_hidden_prefilter(output_dir)
-
-        if manifest_path.exists() and not replace_existing:
-            raise ValueError(
-                "live hidden prefilter no longer matches the resumed training run"
-            )
-
+        os.replace(filtered_tmp_path, filtered_path)
         os.replace(rejected_tmp_path, rejected_path)
         _atomic_json_dump(manifest, manifest_path)
-        return load_live_hidden_prefilter(output_dir)
+        return validate_prepared_live_hidden_data(
+            manifest_path=manifest_path,
+            filtered_path=filtered_path,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            max_length=max_length,
+            min_loss_tokens=min_loss_tokens,
+            target_model_name_or_path=target_model_name_or_path,
+            target_revision=target_revision,
+        )
     finally:
+        filtered_tmp_path.unlink(missing_ok=True)
         rejected_tmp_path.unlink(missing_ok=True)
 
 
-def load_live_hidden_prefilter(output_dir) -> LiveHiddenPrefilter:
-    output_dir = Path(output_dir)
-    manifest_path = output_dir / MANIFEST_FILE_NAME
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-
-    if int(manifest.get("version", -1)) != LIVE_HIDDEN_PREFILTER_VERSION:
-        raise ValueError("unsupported live hidden prefilter version")
-
-    rejected_path = output_dir / manifest["rejected_file"]
-    if _sha256_file(rejected_path) != manifest["rejected_sha256"]:
-        raise ValueError("live hidden rejected index checksum mismatch")
-
+def _load_rejected_indices(
+    *, rejected_path: Path, source_samples: int
+) -> tuple[int, ...]:
     rejected_indices = []
     with rejected_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             entry = json.loads(line)
             rejected_indices.append(int(entry["source_index"]))
-
-    source_samples = int(manifest["source_samples"])
-    rejected_samples = int(manifest["rejected_samples"])
-    accepted_samples = int(manifest["accepted_samples"])
     if (
         rejected_indices != sorted(set(rejected_indices))
-        or len(rejected_indices) != rejected_samples
-        or accepted_samples != source_samples - rejected_samples
         or any(index < 0 or index >= source_samples for index in rejected_indices)
     ):
         raise ValueError("invalid live hidden rejected index")
+    return tuple(rejected_indices)
 
-    return LiveHiddenPrefilter(
+
+def load_prepared_live_hidden_metadata(
+    *, manifest_path, filtered_path
+) -> PreparedLiveHiddenData:
+    manifest_path = Path(manifest_path).resolve(strict=True)
+    filtered_path = Path(filtered_path).resolve(strict=True)
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if int(manifest.get("version", -1)) != LIVE_HIDDEN_DATA_VERSION:
+        raise ValueError("unsupported prepared live hidden data version")
+
+    rejected_path = manifest_path.parent / manifest["rejected_file"]
+    source_samples = int(manifest["source_samples"])
+    accepted_samples = int(manifest["accepted_samples"])
+    rejected_samples = int(manifest["rejected_samples"])
+    rejected_indices = _load_rejected_indices(
+        rejected_path=rejected_path,
+        source_samples=source_samples,
+    )
+    if (
+        len(rejected_indices) != rejected_samples
+        or accepted_samples != source_samples - rejected_samples
+    ):
+        raise ValueError("invalid prepared live hidden sample counts")
+
+    return PreparedLiveHiddenData(
         manifest_path=manifest_path,
+        filtered_path=filtered_path,
         rejected_path=rejected_path,
         source_samples=source_samples,
         accepted_samples=accepted_samples,
         rejected_samples=rejected_samples,
-        rejected_indices=tuple(rejected_indices),
+        rejected_indices=rejected_indices,
     )
 
 
-def map_live_hidden_index(
-    index: int,
+def validate_prepared_live_hidden_data(
     *,
-    source_samples: int,
-    rejected_indices: tuple[int, ...],
-) -> int:
-    accepted_samples = int(source_samples) - len(rejected_indices)
-    if not 0 <= int(index) < accepted_samples:
-        raise IndexError(index)
-    if not rejected_indices:
-        return int(index)
+    manifest_path,
+    filtered_path,
+    tokenizer,
+    chat_template: str,
+    max_length: int,
+    min_loss_tokens: int,
+    target_model_name_or_path: str,
+    target_revision: str | None,
+) -> PreparedLiveHiddenData:
+    prepared = load_prepared_live_hidden_metadata(
+        manifest_path=manifest_path,
+        filtered_path=filtered_path,
+    )
+    with prepared.manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
 
-    target_count = int(index) + 1
-    low = 0
-    high = int(source_samples) - 1
-    while low < high:
-        middle = (low + high) // 2
-        accepted_through_middle = middle + 1 - bisect_right(
-            rejected_indices, middle
-        )
-        if accepted_through_middle >= target_count:
-            high = middle
-        else:
-            low = middle + 1
-    return low
+    expected_contract = _training_contract(
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+        max_length=max_length,
+        min_loss_tokens=min_loss_tokens,
+        target_model_name_or_path=target_model_name_or_path,
+        target_revision=target_revision,
+    )
+    for field, expected in expected_contract.items():
+        if manifest.get(field) != expected:
+            raise ValueError(
+                f"prepared live hidden {field} mismatch: "
+                f"{manifest.get(field)!r} != {expected!r}"
+            )
+
+    filtered_sha256, filtered_samples = _sha256_file_and_count_lines(
+        prepared.filtered_path
+    )
+    if filtered_sha256 != manifest["filtered_sha256"]:
+        raise ValueError("prepared live hidden JSONL checksum mismatch")
+    if filtered_samples != prepared.accepted_samples:
+        raise ValueError("prepared live hidden JSONL sample count mismatch")
+    if _sha256_file(prepared.rejected_path) != manifest["rejected_sha256"]:
+        raise ValueError("prepared live hidden rejected index checksum mismatch")
+    return prepared
