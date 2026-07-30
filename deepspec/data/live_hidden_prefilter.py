@@ -49,48 +49,6 @@ def _json_line(payload) -> bytes:
     ).encode("utf-8")
 
 
-def _sha256_json(payload) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _tokenizer_identity(tokenizer):
-    tokenizer_type = type(tokenizer)
-    init_kwargs = getattr(tokenizer, "init_kwargs", {})
-    resolved_revision = (
-        init_kwargs.get("_commit_hash") if isinstance(init_kwargs, dict) else None
-    )
-    identity = {
-        "class": f"{tokenizer_type.__module__}.{tokenizer_type.__qualname__}",
-        "name_or_path": (
-            str(tokenizer.name_or_path)
-            if getattr(tokenizer, "name_or_path", None) is not None
-            else None
-        ),
-        "resolved_revision": (
-            str(resolved_revision) if resolved_revision is not None else None
-        ),
-    }
-
-    chat_template = getattr(tokenizer, "chat_template", None)
-    if chat_template is not None:
-        identity["chat_template_sha256"] = _sha256_json(chat_template)
-
-    backend = getattr(tokenizer, "backend_tokenizer", None)
-    if backend is not None and hasattr(backend, "to_str"):
-        identity["backend_sha256"] = hashlib.sha256(
-            backend.to_str().encode("utf-8")
-        ).hexdigest()
-    elif hasattr(tokenizer, "get_vocab"):
-        identity["vocab_sha256"] = _sha256_json(tokenizer.get_vocab())
-    return identity
-
-
 def _atomic_json_dump(payload, path: Path) -> None:
     tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
@@ -139,19 +97,19 @@ def _rejection(
 
 def _training_contract(
     *,
-    tokenizer,
     chat_template: str,
     max_length: int,
     min_loss_tokens: int,
     target_model_name_or_path: str,
     target_revision: str | None,
 ):
+    # Fast-tokenizer backend serialization includes mutable truncation and
+    # padding state, so it is not a reproducible artifact identity.
     return {
         "target_model_name_or_path": str(target_model_name_or_path),
         "target_revision": (
             str(target_revision) if target_revision is not None else None
         ),
-        "tokenizer": _tokenizer_identity(tokenizer),
         "chat_template": str(chat_template),
         "max_length": int(max_length),
         "min_loss_tokens": int(min_loss_tokens),
@@ -291,7 +249,6 @@ def prepare_live_hidden_data(
             "rejected_sha256": rejected_digest.hexdigest(),
             "rejected_samples": rejected_samples,
             **_training_contract(
-                tokenizer=tokenizer,
                 chat_template=chat_template,
                 max_length=max_length,
                 min_loss_tokens=min_loss_tokens,
@@ -306,7 +263,6 @@ def prepare_live_hidden_data(
         return validate_prepared_live_hidden_data(
             manifest_path=manifest_path,
             filtered_path=filtered_path,
-            tokenizer=tokenizer,
             chat_template=chat_template,
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
@@ -373,7 +329,6 @@ def validate_prepared_live_hidden_data(
     *,
     manifest_path,
     filtered_path,
-    tokenizer,
     chat_template: str,
     max_length: int,
     min_loss_tokens: int,
@@ -388,7 +343,6 @@ def validate_prepared_live_hidden_data(
         manifest = json.load(handle)
 
     expected_contract = _training_contract(
-        tokenizer=tokenizer,
         chat_template=chat_template,
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
