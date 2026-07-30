@@ -100,6 +100,33 @@ train_datasets/qwen3_4b/perfectblend_train_regen_error.jsonl
 
 Stop the sglang servers before the next step if they are using the same GPUs.
 
+## Alternative: Live Hidden-State Training
+
+DSpark can consume the regenerated JSONL directly by setting
+`data.train_jsonl_path` and requesting target hidden states during training.
+This path does not build the large target cache described below.
+
+Before the training schedule and sampler are created, DeepSpec tokenizes every
+source row with the configured target tokenizer, chat template, `max_length`,
+and `min_loss_tokens`. Rows that cannot provide enough supervised tokens after
+truncation are excluded from the dataset view, so they cannot terminate a
+training run later.
+
+The source JSONL remains the only copy of the conversation text. DeepSpec writes
+only two small artifacts under the experiment checkpoint directory:
+
+```text
+live_hidden_prefilter/rejected.jsonl
+live_hidden_prefilter/manifest.json
+```
+
+Each rejected entry contains its zero-based `source_index`, optional source
+`id`, rejection reason, and token counts. It does not copy the conversation.
+The manifest records the source SHA256, target/tokenizer identity, filtering
+parameters, and source/accepted/rejected counts. `LiveHiddenDataset` derives the
+accepted view as `source - rejected`, preserving source order without writing a
+second accepted JSONL.
+
 ## Step 3: Prepare Target Cache
 
 The training loop reads a precomputed target cache instead of repeatedly running the target model. Prepare it with:

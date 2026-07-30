@@ -1,6 +1,12 @@
+from pathlib import Path
+
 import torch
 
 from deepspec.data import CacheCollator
+from deepspec.data.live_hidden_prefilter import (
+    load_live_hidden_prefilter,
+    prepare_live_hidden_prefilter,
+)
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.gemma4.config import (
     build_draft_config as build_gemma4_draft_config,
@@ -36,6 +42,29 @@ class Qwen3DSparkTrainer(BaseTrainer):
             )
         from deepspec.data.live_hidden_dataset import LiveHiddenDataset
 
+        prefilter_dir = Path(self.checkpoint_dir_root) / "live_hidden_prefilter"
+        if self.global_rank == 0:
+            prefilter = prepare_live_hidden_prefilter(
+                source_path=train_jsonl_path,
+                output_dir=prefilter_dir,
+                tokenizer=self.tokenizer,
+                chat_template=data_args.chat_template,
+                max_length=int(data_args.max_length),
+                min_loss_tokens=int(data_args.min_loss_tokens),
+                expected_num_samples=data_args.get("expected_num_samples"),
+                target_model_name_or_path=self.args.model.target_model_name_or_path,
+                target_revision=self.args.model.get("target_revision"),
+                replace_existing=self.resume_checkpoint_dir is None,
+            )
+            print(
+                "Live hidden prefilter: "
+                f"{prefilter.accepted_samples}/{prefilter.source_samples} accepted, "
+                f"{prefilter.rejected_samples} rejected -> {prefilter.rejected_path}",
+                flush=True,
+            )
+        torch.distributed.barrier()
+        prefilter = load_live_hidden_prefilter(prefilter_dir)
+
         return LiveHiddenDataset(
             data_path=train_jsonl_path,
             tokenizer=self.tokenizer,
@@ -50,6 +79,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
             final_norm_weight=self._target_final_norm_weight,
             final_norm_eps=self._target_final_norm_eps,
             expected_num_samples=data_args.expected_num_samples,
+            rejected_indices=prefilter.rejected_indices,
         )
 
     def _build_draft_model(self, *, target_config, model_args):
