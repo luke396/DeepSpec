@@ -100,6 +100,47 @@ train_datasets/qwen3_4b/perfectblend_train_regen_error.jsonl
 
 Stop the sglang servers before the next step if they are using the same GPUs.
 
+## Alternative: Live Hidden-State Training
+
+DSpark can request target hidden states during training instead of building the
+large target cache described below. First materialize a train-ready JSONL:
+
+```bash
+python scripts/data/prepare_live_hidden_data.py \
+    --input-file-path train_datasets/qwen3_4b/perfectblend_train_regen.jsonl \
+    --output-file-path train_datasets/qwen3_4b/perfectblend_train_ready.jsonl \
+    --artifact-dir train_datasets/qwen3_4b/perfectblend_train_filter \
+    --target-model-name-or-path Qwen/Qwen3-4B \
+    --chat-template qwen \
+    --max-length 4096 \
+    --min-loss-tokens 14
+```
+
+The command tokenizes every source row with the configured target tokenizer,
+chat template, `max_length`, and `min_loss_tokens`. It writes accepted rows
+byte-for-byte and in source order to the output JSONL. Rows that cannot provide
+enough supervised tokens after truncation, or cannot be parsed and rendered,
+are excluded before training.
+
+The preparation produces:
+
+```text
+perfectblend_train_ready.jsonl
+perfectblend_train_filter/rejected.jsonl
+perfectblend_train_filter/manifest.json
+```
+
+Each rejected entry contains its zero-based `source_index`, optional source
+`id`, rejection reason, and token counts. It does not copy the conversation.
+The manifest records input and filtered SHA256 values, target/tokenizer
+identity, filtering parameters, and source/accepted/rejected counts.
+
+Set `data.train_jsonl_path` to the filtered JSONL and
+`data.train_manifest_path` to its manifest. Trainer startup validates the
+filtered file, rejected index, tokenizer, and preprocessing contract, then
+derives the schedule from the filtered row count. It does not repeat the full
+tokenizer scan.
+
 ## Step 3: Prepare Target Cache
 
 The training loop reads a precomputed target cache instead of repeatedly running the target model. Prepare it with:

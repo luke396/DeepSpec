@@ -36,6 +36,16 @@ bash scripts/train/train.sh
 
 `train.sh` launches `train.py`, which spawns one worker per visible GPU. Select the algorithm and target model by pointing `config_path` at one of the configs under [config/](./config/) (e.g. `config/dspark/dspark_qwen3_4b.py`); see the script header for the full list of configs, how to override `config_path` / `target_cache_dir`, and how to use `--opts` to override individual config fields. Checkpoints are written to `~/checkpoints/<project_name>/<exp_name>/step_*`.
 
+DSpark also supports live hidden-state training through a train-ready JSONL and
+its `data.train_manifest_path`. Prepare both once with
+`scripts/data/prepare_live_hidden_data.py`; the command applies the exact
+training tokenizer, truncation, and supervision threshold before training.
+Trainer startup validates the prepared artifact and consumes the filtered JSONL
+directly, without rescanning the complete dataset or allowing a
+low-supervision row to terminate the run. See
+[scripts/data/README.md](./scripts/data/README.md#alternative-live-hidden-state-training)
+for the artifact contract.
+
 Hardware: the default configs and scripts assume a single node with 8 GPUs. For fewer GPUs, reduce `CUDA_VISIBLE_DEVICES`.
 
 

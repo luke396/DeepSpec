@@ -168,8 +168,9 @@ class LiveHiddenDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         batch = self._token_collator([self.dataset[index]])
         if batch is None:
-            raise ValueError(
-                f"training sample {index} has fewer than the required loss tokens"
+            raise RuntimeError(
+                "prepared live hidden data contract changed for sample "
+                f"{index}"
             )
         input_ids = batch["input_ids"][0]
         loss_mask = batch["loss_mask"][0]

@@ -55,6 +55,7 @@ logging = dict(
 data = dict(
     target_cache_path=None,
     train_jsonl_path=None,
+    train_manifest_path=None,
     vllm_endpoint=None,
     vllm_model=None,
     hidden_states_path=None,
