@@ -335,6 +335,8 @@ def test_live_preparation_materializes_trainable_rows_and_minimal_rejections(
     assert prepared.rejected_samples == 2
     assert prepared.rejected_indices == (1, 2)
     assert filtered_path.read_bytes() == accepted_line
+    manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
+    assert "tokenizer" not in manifest
     assert {path.name for path in artifact_dir.iterdir()} == {
         "manifest.json",
         "rejected.jsonl",
@@ -414,7 +416,6 @@ def test_prepared_live_hidden_validation_rejects_filtered_content_drift(tmp_path
         validate_prepared_live_hidden_data(
             manifest_path=prepared.manifest_path,
             filtered_path=filtered_path,
-            tokenizer=FakeTokenizer(),
             chat_template="qwen",
             max_length=32768,
             min_loss_tokens=1,
@@ -444,13 +445,50 @@ def test_prepared_live_hidden_validation_rejects_training_contract_drift(tmp_pat
         validate_prepared_live_hidden_data(
             manifest_path=prepared.manifest_path,
             filtered_path=filtered_path,
-            tokenizer=FakeTokenizer(),
             chat_template="qwen",
             max_length=4096,
             min_loss_tokens=1,
             target_model_name_or_path="Qwen/Qwen3-8B",
             target_revision="b" * 40,
         )
+
+
+def test_prepared_live_hidden_validation_ignores_legacy_tokenizer_metadata(
+    tmp_path,
+):
+    source_path = tmp_path / "regen.unfiltered.jsonl"
+    filtered_path = tmp_path / "regen.canonical.jsonl"
+    _write_dataset(source_path)
+    prepared = prepare_live_hidden_data(
+        source_path=source_path,
+        filtered_path=filtered_path,
+        artifact_dir=tmp_path / "filter",
+        tokenizer=FakeTokenizer(),
+        chat_template="qwen",
+        max_length=32768,
+        min_loss_tokens=1,
+        expected_num_samples=1,
+        target_model_name_or_path="Qwen/Qwen3-8B",
+        target_revision="b" * 40,
+    )
+    manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
+    manifest["tokenizer"] = {"backend_sha256": "stale-runtime-state"}
+    prepared.manifest_path.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    validated = validate_prepared_live_hidden_data(
+        manifest_path=prepared.manifest_path,
+        filtered_path=filtered_path,
+        chat_template="qwen",
+        max_length=32768,
+        min_loss_tokens=1,
+        target_model_name_or_path="Qwen/Qwen3-8B",
+        target_revision="b" * 40,
+    )
+
+    assert validated.accepted_samples == 1
 
 
 def test_dspark_trainer_consumes_prepared_jsonl_without_full_prefilter(

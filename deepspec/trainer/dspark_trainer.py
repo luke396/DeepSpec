@@ -49,7 +49,6 @@ class Qwen3DSparkTrainer(BaseTrainer):
             prepared = validate_prepared_live_hidden_data(
                 manifest_path=train_manifest_path,
                 filtered_path=train_jsonl_path,
-                tokenizer=self.tokenizer,
                 chat_template=data_args.chat_template,
                 max_length=int(data_args.max_length),
                 min_loss_tokens=int(data_args.min_loss_tokens),
