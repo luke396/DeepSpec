@@ -1,6 +1,6 @@
 """Regression tests for the optional DSpark loss temperature (issue #253).
 
-The scalar/tensor temperature only rescales the CE and L1 terms as
+The scalar temperature only rescales the CE and L1 terms as
 ``T * f(z / T)``. Confidence targets and the train-side accept-rate metrics
 stay on the frozen T=1 definition, and ``loss_temperature=None`` must remain
 bit-for-bit identical to the historical code path.
@@ -192,22 +192,6 @@ def test_temperature_one_matches_none_bitwise():
         assert torch.equal(one_terms[key], none_terms[key]), key
 
 
-@pytest.mark.parametrize(
-    "temperature_shape",
-    [(), (1, 1, 1), (2, 1, 1), (2, 2, 3)],
-    ids=["0d", "broadcast-1", "per-sample", "per-token"],
-)
-def test_constant_tensor_temperature_matches_scalar_bitwise(temperature_shape):
-    outputs = _make_random_outputs()
-    scalar_terms = _collect(outputs, loss_temperature=0.7)
-    tensor_terms = _collect(
-        outputs,
-        loss_temperature=torch.full(temperature_shape, 0.7, dtype=torch.float32),
-    )
-    for key in LOSS_TERM_KEYS:
-        assert torch.equal(tensor_terms[key], scalar_terms[key]), key
-
-
 def test_confidence_and_accept_metrics_are_temperature_invariant(monkeypatch):
     captured = {}
 
@@ -228,7 +212,7 @@ def test_confidence_and_accept_metrics_are_temperature_invariant(monkeypatch):
         return terms, store
 
     none_terms, none_metrics = _run(None)
-    for loss_temperature in (0.7, torch.full((2, 1, 1), 0.7)):
+    for loss_temperature in (0.7,):
         temp_terms, temp_metrics = _run(loss_temperature)
 
         # CE/L1 must actually move, otherwise this test proves nothing.
@@ -255,8 +239,8 @@ def test_confidence_and_accept_metrics_are_temperature_invariant(monkeypatch):
 
 @pytest.mark.parametrize(
     "loss_temperature",
-    [0.0, -0.5, torch.tensor([0.7, 0.0]), torch.tensor(-1.0)],
-    ids=["zero", "negative", "tensor-with-zero", "tensor-negative"],
+    [0.0, -0.5],
+    ids=["zero", "negative"],
 )
 def test_non_positive_temperature_raises(loss_temperature):
     outputs = _make_toy_outputs()
