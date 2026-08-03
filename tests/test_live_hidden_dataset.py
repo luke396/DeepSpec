@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
+import deepspec.data.live_hidden_data as prepared_module
 import deepspec.data.live_hidden_dataset as live_module
 import deepspec.data.jsonl_dataset as jsonl_module
 from deepspec.data.live_hidden_dataset import LiveHiddenDataset
@@ -389,6 +390,42 @@ def test_live_preparation_materializes_trainable_rows_and_minimal_rejections(
     assert len(dataset) == 1
     assert dataset[0]["loss_mask"].sum().item() >= 1
     assert len(completions.calls) == 1
+
+
+def test_live_preparation_preserves_unexpected_preprocessing_error(
+    monkeypatch, tmp_path
+):
+    source_path = tmp_path / "regen.unfiltered.jsonl"
+    filtered_path = tmp_path / "regen.canonical.jsonl"
+    artifact_dir = tmp_path / "filter"
+    _write_dataset(source_path, count=2)
+    preprocess_record = prepared_module.preprocess_record
+
+    def fail_second_record(**kwargs):
+        if kwargs["record"]["id"] == "row-1":
+            raise RuntimeError("unexpected tokenizer failure")
+        return preprocess_record(**kwargs)
+
+    monkeypatch.setattr(prepared_module, "preprocess_record", fail_second_record)
+
+    with pytest.raises(RuntimeError, match="unexpected tokenizer failure") as exc_info:
+        prepare_live_hidden_data(
+            source_path=source_path,
+            filtered_path=filtered_path,
+            artifact_dir=artifact_dir,
+            tokenizer=FakeTokenizer(),
+            chat_template="qwen",
+            max_length=32768,
+            min_loss_tokens=1,
+            expected_num_samples=2,
+            target_model_name_or_path="Qwen/Qwen3-8B",
+            target_revision="b" * 40,
+        )
+
+    assert exc_info.traceback[-1].name == "fail_second_record"
+    assert not filtered_path.exists()
+    assert artifact_dir.is_dir()
+    assert list(artifact_dir.iterdir()) == []
 
 
 def test_prepared_live_hidden_validation_rejects_filtered_content_drift(tmp_path):

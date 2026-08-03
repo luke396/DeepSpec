@@ -118,9 +118,10 @@ python scripts/data/prepare_live_hidden_data.py \
 
 The command tokenizes every source row with the configured target tokenizer,
 chat template, `max_length`, and `min_loss_tokens`. It writes accepted rows
-byte-for-byte and in source order to the output JSONL. Rows that cannot provide
-enough supervised tokens after truncation, or cannot be parsed and rendered,
-are excluded before training.
+byte-for-byte and in source order to the output JSONL. Invalid UTF-8/JSON rows
+and rows that cannot provide enough supervised tokens after truncation are
+excluded before training. Upstream preprocessing or tokenizer failures stop
+the command with their original traceback.
 
 The preparation produces:
 
