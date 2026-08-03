@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -6,6 +6,31 @@ import torch.nn.functional as F
 
 from deepspec.utils.metrics import add_metric
 from .common import DSparkForwardOutput
+
+
+def _normalize_loss_temperature(
+    loss_temperature: Optional[Union[float, torch.Tensor]],
+) -> Optional[Union[float, torch.Tensor]]:
+    """Validate the optional CE/L1 loss temperature at the loss entry.
+
+    ``None`` keeps the historical T=1 code path bit-for-bit. A python float
+    applies one temperature to every supervised token; a tensor must be
+    broadcastable to the ``[batch, num_anchors, block_size]`` token grid
+    (per-sample schedules pass ``[batch, 1, 1]``). Confidence targets and the
+    train-side accept-rate metrics deliberately stay on the T=1 definition.
+    """
+    if loss_temperature is None:
+        return None
+    if torch.is_tensor(loss_temperature):
+        assert bool((loss_temperature > 0).all()), (
+            "loss_temperature entries must be > 0."
+        )
+        return loss_temperature
+    loss_temperature = float(loss_temperature)
+    assert loss_temperature > 0, (
+        f"loss_temperature must be > 0, got {loss_temperature}."
+    )
+    return loss_temperature
 
 
 def _all_reduce_loss_denominators(
@@ -70,18 +95,63 @@ def _compute_accept_rate_3d(
     return accept_rate_3d.clamp_(0.0, 1.0)
 
 
+def _token_temperature_grid(
+    loss_temperature: Union[float, torch.Tensor],
+    *,
+    grid_shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Union[float, torch.Tensor]:
+    """Broadcast a validated temperature onto the supervised-token grid.
+
+    Floats pass through so the scalar arm keeps python-scalar op semantics;
+    tensors are broadcast to ``grid_shape`` (``[batch, num_anchors,
+    block_size]``), which is the alignment contract for future per-sample
+    schedules (``[batch, 1, 1]``).
+    """
+    if not torch.is_tensor(loss_temperature):
+        return loss_temperature
+    temps = loss_temperature.to(device=device, dtype=dtype)
+    return torch.broadcast_to(temps, grid_shape)
+
+
 def _compute_local_l1_term(
     *,
     outputs: DSparkForwardOutput,
     aligned_target_logits: Optional[torch.Tensor],
     loss_weight_mask: torch.Tensor,
+    loss_temperature: Optional[Union[float, torch.Tensor]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     zero = outputs.draft_logits.new_zeros((), dtype=torch.float32)
     if aligned_target_logits is None:
         return zero, zero
-    draft_probs = torch.softmax(outputs.draft_logits.float(), dim=-1)
-    target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-    l1_dist_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+    if loss_temperature is None:
+        draft_probs = torch.softmax(outputs.draft_logits.float(), dim=-1)
+        target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
+        l1_dist_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+    else:
+        token_temps = _token_temperature_grid(
+            loss_temperature,
+            grid_shape=outputs.draft_logits.shape[:-1],
+            device=outputs.draft_logits.device,
+            dtype=torch.float32,
+        )
+        logit_temps = (
+            token_temps.unsqueeze(-1)
+            if torch.is_tensor(token_temps)
+            else token_temps
+        )
+        draft_probs = torch.softmax(
+            outputs.draft_logits.float() / logit_temps, dim=-1
+        )
+        target_probs = torch.softmax(
+            aligned_target_logits.float() / logit_temps, dim=-1
+        )
+        # The leading T factor keeps requests weight-equal inside a batch and
+        # bounds the T->0 limit; see issue #253 for the derivation.
+        l1_dist_per_token = token_temps * (
+            (draft_probs - target_probs).abs().sum(dim=-1)
+        )
     l1_loss_num = (l1_dist_per_token * loss_weight_mask).sum()
     l1_loss_den = loss_weight_mask.sum()
     return l1_loss_num, l1_loss_den
@@ -92,6 +162,7 @@ def _collect_local_terms(
     outputs: DSparkForwardOutput,
     loss_decay_gamma: Optional[float],
     l1_loss_alpha: float,
+    loss_temperature: Optional[Union[float, torch.Tensor]] = None,
 ) -> tuple[dict[str, torch.Tensor], bool]:
     draft_logits = outputs.draft_logits
     target_ids = outputs.target_ids
@@ -99,6 +170,7 @@ def _collect_local_terms(
     block_keep_mask = outputs.block_keep_mask
     _, _, block_size, vocab_size = draft_logits.shape
     device = draft_logits.device
+    loss_temperature = _normalize_loss_temperature(loss_temperature)
 
     loss_weight_mask = _build_loss_weight_mask(
         eval_mask=eval_mask,
@@ -109,7 +181,33 @@ def _collect_local_terms(
     flat_logits = draft_logits.reshape(-1, vocab_size)
     flat_targets = target_ids.reshape(-1)
     flat_weights = loss_weight_mask.reshape(-1)
-    loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    if loss_temperature is None:
+        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    else:
+        token_temps = _token_temperature_grid(
+            loss_temperature,
+            grid_shape=draft_logits.shape[:-1],
+            device=device,
+            dtype=flat_logits.dtype,
+        )
+        flat_temps = (
+            token_temps.reshape(-1)
+            if torch.is_tensor(token_temps)
+            else token_temps
+        )
+        logit_temps = (
+            flat_temps.unsqueeze(-1)
+            if torch.is_tensor(flat_temps)
+            else flat_temps
+        )
+        # T * CE(z / T, y): the division realigns the distribution with the
+        # request temperature; the leading T factor removes the 1/T gradient
+        # prefactor so requests stay weight-equal inside a batch (issue #253).
+        loss_per_token = flat_temps * F.cross_entropy(
+            flat_logits / logit_temps,
+            flat_targets,
+            reduction="none",
+        )
     ce_loss_num = (loss_per_token * flat_weights).sum()
     ce_loss_den = flat_weights.sum()
     aligned_target_logits = outputs.aligned_target_logits
@@ -126,6 +224,7 @@ def _collect_local_terms(
             outputs=outputs,
             aligned_target_logits=aligned_target_logits,
             loss_weight_mask=loss_weight_mask,
+            loss_temperature=loss_temperature,
         )
     else:
         l1_loss_num = zero
@@ -259,11 +358,13 @@ def compute_dspark_loss(
     ce_loss_alpha: float,
     l1_loss_alpha: float,
     confidence_head_alpha: float,
+    loss_temperature: Optional[Union[float, torch.Tensor]] = None,
 ):
     loss_terms, has_confidence = _collect_local_terms(
         outputs=outputs,
         loss_decay_gamma=loss_decay_gamma,
         l1_loss_alpha=float(l1_loss_alpha),
+        loss_temperature=loss_temperature,
     )
     world_size = dist.get_world_size()
     global_denominators = _all_reduce_loss_denominators(

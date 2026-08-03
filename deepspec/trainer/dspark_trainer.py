@@ -104,6 +104,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
             ce_loss_alpha=float(self.args.model.ce_loss_alpha),
             l1_loss_alpha=float(self.args.model.l1_loss_alpha),
             confidence_head_alpha=float(self.args.model.confidence_head_alpha),
+            loss_temperature=self.args.model.get("loss_temperature"),
         )
         return loss
 

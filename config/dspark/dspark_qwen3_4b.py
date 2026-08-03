@@ -27,6 +27,7 @@ model = dict(
     loss_decay_gamma=4.0,
     ce_loss_alpha=0.1,
     l1_loss_alpha=0.9,
+    loss_temperature=None,
 )
 
 train = dict(
