@@ -186,31 +186,22 @@ def prepare_live_hidden_data(
                     )
 
                 if rejection is None:
-                    try:
-                        processed = preprocess_record(
-                            record=record,
-                            tokenizer=tokenizer,
-                            chat_template=chat_template,
-                            max_length=int(max_length),
-                        )
-                    except Exception as exc:
+                    processed = preprocess_record(
+                        record=record,
+                        tokenizer=tokenizer,
+                        chat_template=chat_template,
+                        max_length=int(max_length),
+                    )
+                    sequence_tokens = int(processed["input_ids"].shape[0])
+                    loss_tokens = int(processed["loss_mask"].sum().item())
+                    if loss_tokens < int(min_loss_tokens):
                         rejection = _rejection(
                             source_index=source_index,
                             record_id=record_id,
-                            reason="preprocess_error",
-                            error_type=type(exc).__name__,
+                            reason="insufficient_loss_tokens",
+                            sequence_tokens=sequence_tokens,
+                            loss_tokens=loss_tokens,
                         )
-                    else:
-                        sequence_tokens = int(processed["input_ids"].shape[0])
-                        loss_tokens = int(processed["loss_mask"].sum().item())
-                        if loss_tokens < int(min_loss_tokens):
-                            rejection = _rejection(
-                                source_index=source_index,
-                                record_id=record_id,
-                                reason="insufficient_loss_tokens",
-                                sequence_tokens=sequence_tokens,
-                                loss_tokens=loss_tokens,
-                            )
 
                 if rejection is None:
                     filtered_handle.write(raw_line)
