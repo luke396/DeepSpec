@@ -13,7 +13,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 import deepspec.data.live_hidden_dataset as live_module
 import deepspec.data.jsonl_dataset as jsonl_module
 from deepspec.data.live_hidden_dataset import LiveHiddenDataset
-from deepspec.data.live_hidden_prefilter import (
+from deepspec.data.live_hidden_data import (
     prepare_live_hidden_data,
     validate_prepared_live_hidden_data,
 )
@@ -491,7 +491,7 @@ def test_prepared_live_hidden_validation_ignores_legacy_tokenizer_metadata(
     assert validated.accepted_samples == 1
 
 
-def test_dspark_trainer_consumes_prepared_jsonl_without_full_prefilter(
+def test_dspark_trainer_consumes_prepared_jsonl_without_full_preparation_scan(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(jsonl_module, "CACHE_DIR", str(tmp_path / "index-cache"))

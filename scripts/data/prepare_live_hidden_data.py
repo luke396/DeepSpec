@@ -4,7 +4,7 @@ import os
 
 from transformers import AutoTokenizer
 
-from deepspec.data.live_hidden_prefilter import prepare_live_hidden_data
+from deepspec.data.live_hidden_data import prepare_live_hidden_data
 
 
 def parse_args():

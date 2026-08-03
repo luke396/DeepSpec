@@ -132,14 +132,16 @@ perfectblend_train_filter/manifest.json
 
 Each rejected entry contains its zero-based `source_index`, optional source
 `id`, rejection reason, and token counts. It does not copy the conversation.
-The manifest records input and filtered SHA256 values, target identity,
-filtering parameters, and source/accepted/rejected counts.
+The manifest records input and filtered SHA256 values, the configured target
+locator and revision, preparation parameters, and source/accepted/rejected
+counts. The locator and revision are configuration values, not a digest of the
+target model contents.
 
 Set `data.train_jsonl_path` to the filtered JSONL and
 `data.train_manifest_path` to its manifest. Trainer startup validates the
-filtered file, rejected index, target identity, and preprocessing contract,
-then derives the schedule from the filtered row count. It does not repeat the
-full tokenizer scan.
+filtered file, rejected index, configured target locator and revision, and
+preprocessing contract, then derives the schedule from the filtered row count.
+It does not repeat the full tokenizer scan.
 
 ## Step 3: Prepare Target Cache
 
