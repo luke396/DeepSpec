@@ -271,3 +271,92 @@ def test_compute_dspark_loss_threads_temperature(monkeypatch):
     # max_j z_j - z_y, so the scaled loss stays finite for small T.
     small_t = _loss(1e-3)
     assert torch.isfinite(small_t)
+
+
+def test_per_sample_tensor_constant_matches_scalar_bitwise():
+    outputs = _make_random_outputs()
+    scalar_terms = _collect(outputs, loss_temperature=0.7)
+    tensor_terms = _collect(
+        outputs,
+        loss_temperature=torch.full((2,), 0.7, dtype=torch.float32),
+    )
+    for key in LOSS_TERM_KEYS:
+        assert torch.equal(tensor_terms[key], scalar_terms[key]), key
+
+
+def test_per_sample_tensor_mixes_per_row_scalars():
+    # A [batch] tensor must equal computing each sample with its own scalar
+    # temperature and summing the (numerator, denominator) pairs.
+    outputs = _make_random_outputs()
+    temperatures = (0.5, 1.2)
+    mixed_terms = _collect(
+        outputs,
+        loss_temperature=torch.tensor(temperatures, dtype=torch.float32),
+    )
+
+    def _single(sample_index):
+        sliced = DSparkForwardOutput(
+            draft_logits=outputs.draft_logits[sample_index : sample_index + 1],
+            target_ids=outputs.target_ids[sample_index : sample_index + 1],
+            eval_mask=outputs.eval_mask[sample_index : sample_index + 1],
+            block_keep_mask=outputs.block_keep_mask[sample_index : sample_index + 1],
+            confidence_pred=outputs.confidence_pred[sample_index : sample_index + 1],
+            aligned_target_logits=outputs.aligned_target_logits[
+                sample_index : sample_index + 1
+            ],
+        )
+        return _collect(sliced, loss_temperature=temperatures[sample_index])
+
+    first, second = _single(0), _single(1)
+    for key in LOSS_TERM_KEYS:
+        combined = first[key] + second[key]
+        assert torch.allclose(mixed_terms[key], combined, atol=1e-5), key
+
+
+def test_per_sample_tensor_keeps_confidence_and_metrics_frozen(monkeypatch):
+    captured_none, captured_tensor = {}, {}
+
+    def _capture_factory(store):
+        def _capture(name, value, *, den=None, reduction=None, tag="train"):
+            store[f"{tag}/{name}"] = (
+                value.detach().clone(),
+                None if den is None else den.detach().clone(),
+            )
+
+        return _capture
+
+    outputs = _make_random_outputs(seed=11)
+    monkeypatch.setattr(loss_module, "add_metric", _capture_factory(captured_none))
+    none_terms = _collect(outputs, loss_temperature=None)
+
+    outputs = _make_random_outputs(seed=11)
+    monkeypatch.setattr(loss_module, "add_metric", _capture_factory(captured_tensor))
+    tensor_terms = _collect(
+        outputs,
+        loss_temperature=torch.tensor([0.5, 1.2], dtype=torch.float32),
+    )
+
+    assert not torch.equal(tensor_terms["ce_loss_num"], none_terms["ce_loss_num"])
+    assert not torch.equal(tensor_terms["l1_loss_num"], none_terms["l1_loss_num"])
+    assert torch.equal(
+        tensor_terms["confidence_loss_num"], none_terms["confidence_loss_num"]
+    )
+    assert set(captured_tensor) == set(captured_none)
+    for name, (num, den) in captured_none.items():
+        assert torch.equal(captured_tensor[name][0], num), name
+        if den is not None:
+            assert torch.equal(captured_tensor[name][1], den), name
+
+
+def test_compute_dspark_loss_accepts_per_sample_tensor(monkeypatch):
+    monkeypatch.setattr(loss_module.dist, "get_world_size", lambda: 1)
+    outputs = _make_random_outputs()
+    loss = compute_dspark_loss(
+        outputs=outputs,
+        loss_decay_gamma=None,
+        ce_loss_alpha=0.1,
+        l1_loss_alpha=0.9,
+        confidence_head_alpha=1.0,
+        loss_temperature=torch.tensor([0.5, 1.2], dtype=torch.float32),
+    )
+    assert torch.isfinite(loss)

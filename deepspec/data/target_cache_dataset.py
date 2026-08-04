@@ -867,4 +867,9 @@ class CacheCollator:
         batch["attention_mask"] = attention_mask
         for key in ("target_hidden_states", "target_last_hidden_states"):
             batch[key] = _pad_hidden_batch(features, key)
+        # Live rows carry a per-sample loss temperature; cache rows do not.
+        if "loss_temperature" in features[0]:
+            batch["loss_temperature"] = torch.stack(
+                [item["loss_temperature"] for item in features]
+            )
         return batch

@@ -15,6 +15,28 @@ _REQUEST_TIMEOUT_SECONDS = 120
 _LOCK_TIMEOUT_SECONDS = 10
 
 
+def resolve_loss_temperature(row) -> float:
+    """Resolve one canonical regen row's per-sample loss temperature.
+
+    Reads `sampling.temperature` as preserved through fold/regeneration.
+    Greedy requests (T == 0) and rows without a usable value fall back to
+    1.0 — the frozen experiment policy: temperature-alignment has no
+    first-order effect on argmax-verified traffic, and 1.0 reproduces the
+    historical loss for unannotated data. Validation lives here, on the
+    CPU data path, so the loss seam can trust the batch tensor.
+    """
+    sampling = row.get("sampling")
+    if not isinstance(sampling, dict):
+        return 1.0
+    value = sampling.get("temperature")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 1.0
+    value = float(value)
+    if not 0.0 < value < float("inf"):
+        return 1.0
+    return value
+
+
 def _wait_for_hidden_file(path: Path) -> None:
     lock_path = Path(f"{path}.lock")
     if not lock_path.exists():
@@ -166,7 +188,8 @@ class LiveHiddenDataset(torch.utils.data.Dataset):
         )
 
     def __getitem__(self, index):
-        batch = self._token_collator([self.dataset[index]])
+        row = self.dataset[index]
+        batch = self._token_collator([row])
         if batch is None:
             raise RuntimeError(
                 "prepared live hidden data contract changed for sample "
@@ -182,4 +205,7 @@ class LiveHiddenDataset(torch.utils.data.Dataset):
             "loss_mask": loss_mask,
             "target_hidden_states": target_hidden,
             "target_last_hidden_states": self._apply_final_norm(target_last_pre_norm),
+            "loss_temperature": torch.tensor(
+                resolve_loss_temperature(row), dtype=torch.float32
+            ),
         }
