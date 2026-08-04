@@ -98,13 +98,23 @@ class Qwen3DSparkTrainer(BaseTrainer):
             loss_mask=batch["loss_mask"],
             target_last_hidden_states=batch["target_last_hidden_states"],
         )
+        loss_temperature = self.args.model.get("loss_temperature")
+        if loss_temperature == "per-sample":
+            # Live-data rows resolve their own temperature on the CPU data
+            # path (resolve_loss_temperature); cache datasets don't carry it.
+            if "loss_temperature" not in batch:
+                raise ValueError(
+                    "loss_temperature='per-sample' requires the live hidden "
+                    "data path; the batch carries no per-sample temperatures"
+                )
+            loss_temperature = batch["loss_temperature"]
         loss = compute_dspark_loss(
             outputs=outputs,
             loss_decay_gamma=self.args.model.loss_decay_gamma,
             ce_loss_alpha=float(self.args.model.ce_loss_alpha),
             l1_loss_alpha=float(self.args.model.l1_loss_alpha),
             confidence_head_alpha=float(self.args.model.confidence_head_alpha),
-            loss_temperature=self.args.model.get("loss_temperature"),
+            loss_temperature=loss_temperature,
         )
         return loss
 

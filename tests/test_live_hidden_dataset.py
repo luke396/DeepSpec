@@ -18,7 +18,7 @@ from deepspec.data.live_hidden_data import (
     prepare_live_hidden_data,
     validate_prepared_live_hidden_data,
 )
-from deepspec.utils.config import ConfigNode
+from deepspec.utils.config import ConfigNode, to_config_node
 
 
 NORM_WEIGHT = torch.arange(1, 9, dtype=torch.bfloat16) / 8
@@ -221,6 +221,7 @@ def test_direct_jsonl_tokenization_hidden_request_and_qwen_final_norm(
         "loss_mask",
         "target_hidden_states",
         "target_last_hidden_states",
+        "loss_temperature",
     }
     assert completions.calls == [
         {
@@ -606,3 +607,142 @@ def test_dspark_trainer_consumes_prepared_jsonl_without_full_preparation_scan(
 
     assert len(dataset.dataset) == 1
     assert len(dataset) == 1
+
+
+def test_resolve_loss_temperature_policy():
+    resolve = live_module.resolve_loss_temperature
+    # Valid sidecar temperature is honored, including the >1 traffic tail.
+    assert resolve({"sampling": {"temperature": 0.7}}) == 0.7
+    assert resolve({"sampling": {"temperature": 1.33}}) == 1.33
+    # Greedy requests and unusable values fall back to the frozen T=1 policy.
+    assert resolve({"sampling": {"temperature": 0}}) == 1.0
+    assert resolve({"sampling": {"temperature": -0.5}}) == 1.0
+    assert resolve({"sampling": {"temperature": "0.7"}}) == 1.0
+    assert resolve({"sampling": {"temperature": True}}) == 1.0
+    assert resolve({"sampling": {}}) == 1.0
+    assert resolve({"sampling": "bogus"}) == 1.0
+    assert resolve({}) == 1.0
+
+
+def test_dataset_rows_carry_per_sample_loss_temperature(monkeypatch, tmp_path):
+    monkeypatch.setattr(jsonl_module, "CACHE_DIR", str(tmp_path / "index-cache"))
+    data_path = tmp_path / "regen.canonical.jsonl"
+    _write_rows(
+        data_path,
+        [
+            {
+                "conversations": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "sampling": {"temperature": 0.5},
+            },
+            {
+                "conversations": [
+                    {"role": "user", "content": "greedy question"},
+                    {"role": "assistant", "content": "greedy answer"},
+                ],
+                "sampling": {"temperature": 0},
+            },
+        ],
+    )
+    hidden_dir = tmp_path / "hidden"
+    hidden_dir.mkdir()
+    completions = FakeCompletions(hidden_dir)
+    monkeypatch.setattr(
+        live_module.openai, "OpenAI", lambda **_: FakeOpenAI(completions)
+    )
+    dataset = LiveHiddenDataset(
+        data_path=data_path,
+        tokenizer=FakeTokenizer(),
+        chat_template="qwen",
+        max_length=32768,
+        min_loss_tokens=1,
+        vllm_endpoint="http://hidden-router:8000/v1",
+        vllm_model="Qwen/Qwen3-8B",
+        hidden_states_path=hidden_dir,
+        target_layer_ids=[1, 9],
+        hidden_size=8,
+        final_norm_weight=NORM_WEIGHT,
+        final_norm_eps=1e-6,
+        expected_num_samples=2,
+    )
+
+    annotated = dataset[0]
+    greedy = dataset[1]
+    assert annotated["loss_temperature"].dtype == torch.float32
+    assert annotated["loss_temperature"].item() == 0.5
+    assert greedy["loss_temperature"].item() == 1.0
+
+    from deepspec.data.target_cache_dataset import CacheCollator
+
+    batch = CacheCollator()([annotated, greedy])
+    assert torch.equal(
+        batch["loss_temperature"],
+        torch.tensor([0.5, 1.0], dtype=torch.float32),
+    )
+
+    # Cache-style rows without the key keep the historical batch shape.
+    cache_batch = CacheCollator()(
+        [{k: v for k, v in annotated.items() if k != "loss_temperature"}]
+    )
+    assert "loss_temperature" not in cache_batch
+
+
+def test_trainer_dispatches_per_sample_loss_temperature(monkeypatch, tmp_path):
+    trainer_cls = _load_dspark_trainer(monkeypatch)
+    captured = {}
+
+    def _fake_loss(**kwargs):
+        captured.update(kwargs)
+        return torch.tensor(0.0)
+
+    # The helper exec's the module without registering it in sys.modules;
+    # reach its namespace through the class's run_batch globals.
+    trainer_globals = trainer_cls.run_batch.__globals__
+    monkeypatch.setitem(trainer_globals, "compute_dspark_loss", _fake_loss)
+
+    trainer = trainer_cls.__new__(trainer_cls)
+    trainer.model = lambda **_: "outputs"
+    trainer.args = to_config_node(
+        {
+            "model": {
+                "loss_decay_gamma": 4.0,
+                "ce_loss_alpha": 0.1,
+                "l1_loss_alpha": 0.9,
+                "confidence_head_alpha": 1.0,
+                "loss_temperature": "per-sample",
+            }
+        }
+    )
+    batch = {
+        "input_ids": torch.zeros(1, 2, dtype=torch.long),
+        "target_hidden_states": torch.zeros(1, 2, 4),
+        "loss_mask": torch.zeros(1, 2),
+        "target_last_hidden_states": torch.zeros(1, 2, 4),
+        "loss_temperature": torch.tensor([0.5], dtype=torch.float32),
+    }
+    trainer.run_batch(batch)
+    assert torch.equal(
+        captured["loss_temperature"], torch.tensor([0.5], dtype=torch.float32)
+    )
+
+    # per-sample against a batch without temperatures must fail loudly.
+    del batch["loss_temperature"]
+    with pytest.raises(ValueError, match="per-sample"):
+        trainer.run_batch(batch)
+
+    # Scalar and None configs pass through untouched.
+    trainer.args = to_config_node(
+        {
+            "model": {
+                "loss_decay_gamma": 4.0,
+                "ce_loss_alpha": 0.1,
+                "l1_loss_alpha": 0.9,
+                "confidence_head_alpha": 1.0,
+                "loss_temperature": 0.7,
+            }
+        }
+    )
+    trainer.run_batch(batch)
+    assert captured["loss_temperature"] == 0.7
