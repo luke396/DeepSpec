@@ -18,6 +18,17 @@ def parse_args():
     parser.add_argument("--input-file-path", required=True)
     parser.add_argument("--output-file-path", required=True)
     parser.add_argument("--concurrency", type=int, default=64)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("global", "per-request"),
+        default="global",
+        help=(
+            "global: every request uses the CLI sampling values. per-request: "
+            "each input row's `sampling` object overrides them field by field; "
+            "absent fields keep the CLI values, present-but-invalid fields "
+            "fall back to them and are counted."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
@@ -54,6 +65,72 @@ def get_random_reasoning_effort():
     return random.choices(["low", "medium", "high"], weights=[4, 4, 2], k=1)[0]
 
 
+def _valid_temperature(value):
+    # Matches the SpecLoop expand convention (any finite T >= 0), NOT the
+    # [0, 1] range validate_args enforces on the CLI value: sidecar values
+    # were already accepted by serving (traffic carries T up to ~1.33), and
+    # clamping them here would silently distort the per-request policy.
+    return isinstance(value, (int, float)) and 0.0 <= float(value) < float("inf")
+
+
+def _valid_top_p(value):
+    return isinstance(value, (int, float)) and 0.0 < float(value) <= 1.0
+
+
+def _valid_top_k(value):
+    # -1 disables top_k on the serving side; SpecLoop fold rows carry it raw.
+    return isinstance(value, int) and (value == -1 or value > 0)
+
+
+def _valid_penalty(value):
+    return isinstance(value, (int, float)) and -2.0 <= float(value) <= 2.0
+
+
+def _valid_stop(value):
+    # Empty lists resolve to no override so downstream can trust that a
+    # resolved `stop` is always meaningful.
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and item for item in value)
+    )
+
+
+# Per-request `sampling` fields honored from the input row, with their
+# validators. This is the same allowlist SpecLoop fold preserves.
+SAMPLING_VALIDATORS = {
+    "temperature": _valid_temperature,
+    "top_p": _valid_top_p,
+    "top_k": _valid_top_k,
+    "frequency_penalty": _valid_penalty,
+    "presence_penalty": _valid_penalty,
+    "stop": _valid_stop,
+}
+
+
+def resolve_row_sampling(sample, fallback_counts):
+    """Extract one row's usable `sampling` overrides in per-request mode.
+
+    Field-by-field: present-and-valid values are returned as overrides;
+    absent fields are simply not overridden (the CLI globals apply);
+    present-but-invalid values are dropped and counted, falling back to
+    the CLI globals the same way. Never fatal: a raw traffic sidecar is
+    allowed to carry garbage, and regeneration must keep going.
+    """
+    sidecar = sample.get("sampling")
+    if not isinstance(sidecar, dict):
+        return {}
+    overrides = {}
+    for key, is_valid in SAMPLING_VALIDATORS.items():
+        if key not in sidecar:
+            continue
+        if is_valid(sidecar[key]):
+            overrides[key] = sidecar[key]
+        else:
+            fallback_counts[key] += 1
+    return overrides
+
+
 def compute_context_length(conversations):
     length = 0
     for message in conversations:
@@ -67,7 +144,7 @@ def compute_context_length(conversations):
     return length
 
 
-def build_query_kwargs(args, messages, max_tokens=None):
+def build_query_kwargs(args, messages, max_tokens=None, sampling=None):
     query_kwargs = {
         "model": args.model,
         "messages": messages,
@@ -83,6 +160,18 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+
+    # Per-request overrides land after the CLI globals so a row's own
+    # sampling policy wins field by field. resolve_row_sampling is the sole
+    # producer and only emits validated, meaningful values, so they are
+    # trusted verbatim here.
+    if sampling:
+        for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty", "stop"):
+            if key in sampling:
+                query_kwargs[key] = sampling[key]
+        if "top_k" in sampling:
+            extra_body["top_k"] = sampling["top_k"]
+
     if args.min_p is not None:
         extra_body["min_p"] = args.min_p
     if args.enable_thinking:
@@ -103,7 +192,7 @@ def error_sample(sample, message):
     return sample
 
 
-def call_sglang(args, server_address, sample, max_tokens=None):
+def call_sglang(args, server_address, sample, max_tokens=None, sampling=None):
     conversations = sample.get("conversations")
     if not conversations:
         return error_sample(sample, "Missing conversations")
@@ -126,7 +215,9 @@ def call_sglang(args, server_address, sample, max_tokens=None):
         regenerated.append(message)
         try:
             response = client.chat.completions.create(
-                **build_query_kwargs(args, regenerated, max_tokens=max_tokens)
+                **build_query_kwargs(
+                    args, regenerated, max_tokens=max_tokens, sampling=sampling
+                )
             )
         except Exception as exc:
             return error_sample(sample, str(exc))
@@ -261,6 +352,7 @@ def print_config(args):
     print(f"  input: {args.input_file_path}")
     print(f"  output: {args.output_file_path}")
     print(f"  concurrency: {args.concurrency}")
+    print(f"  sampling_mode: {args.sampling_mode}")
     print(f"  max_tokens: {args.max_tokens}")
     print(f"  temperature: {args.temperature}")
     print(f"  top_p: {args.top_p}")
@@ -302,6 +394,8 @@ def main():
         "context_min": None,
         "context_max": 0,
     }
+    fallback_counts = {key: 0 for key in SAMPLING_VALIDATORS}
+    rows_with_sampling = 0
     queues = {server_address: [] for server_address in valid_servers}
     next_server_index = 0
     submitted_count = 0
@@ -326,6 +420,11 @@ def main():
                 break
 
             sample = json.loads(line)
+            sampling = None
+            if args.sampling_mode == "per-request":
+                if isinstance(sample.get("sampling"), dict):
+                    rows_with_sampling += 1
+                sampling = resolve_row_sampling(sample, fallback_counts)
             server_address = valid_servers[next_server_index]
             next_server_index = (next_server_index + 1) % len(valid_servers)
 
@@ -342,7 +441,9 @@ def main():
                 if not wrote_result:
                     time.sleep(0.05)
 
-            future = executor.submit(call_sglang, args, server_address, sample)
+            future = executor.submit(
+                call_sglang, args, server_address, sample, None, sampling
+            )
             queues[server_address].append(future)
             submitted_count += 1
             progress.update(1)
@@ -355,6 +456,33 @@ def main():
     print("Processing completed.")
     print(f"  success: {stats['success']}")
     print(f"  errors: {stats['errors']}")
+    if args.sampling_mode == "per-request":
+        print(f"  rows_with_sampling: {rows_with_sampling}")
+        fallback_total = sum(fallback_counts.values())
+        print(f"  sampling_fallbacks: {fallback_total}")
+        for key, count in fallback_counts.items():
+            if count:
+                print(f"    {key}: {count}")
+        manifest_path = args.output_file_path.replace(".jsonl", "_sampling_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as manifest_handle:
+            json.dump(
+                {
+                    "sampling_mode": args.sampling_mode,
+                    "submitted": submitted_count,
+                    "rows_with_sampling": rows_with_sampling,
+                    "sampling_fallbacks": fallback_counts,
+                    "cli_fallback_values": {
+                        "temperature": args.temperature,
+                        "top_p": args.top_p,
+                        "top_k": args.top_k,
+                    },
+                },
+                manifest_handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            manifest_handle.write("\n")
+        print(f"  sampling_manifest: {manifest_path}")
     if stats["success"] > 0:
         avg_context = stats["context_sum"] / stats["success"]
         print(f"  context_min: {stats['context_min']}")
