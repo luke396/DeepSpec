@@ -70,36 +70,30 @@ def _valid_temperature(value):
     # [0, 1] range validate_args enforces on the CLI value: sidecar values
     # were already accepted by serving (traffic carries T up to ~1.33), and
     # clamping them here would silently distort the per-request policy.
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and 0.0 <= float(value) < float("inf")
-    )
+    return isinstance(value, (int, float)) and 0.0 <= float(value) < float("inf")
 
 
 def _valid_top_p(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and 0.0 < float(value) <= 1.0
-    )
+    return isinstance(value, (int, float)) and 0.0 < float(value) <= 1.0
 
 
 def _valid_top_k(value):
     # -1 disables top_k on the serving side; SpecLoop fold rows carry it raw.
-    return isinstance(value, int) and not isinstance(value, bool) and (value == -1 or value > 0)
+    return isinstance(value, int) and (value == -1 or value > 0)
 
 
 def _valid_penalty(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and -2.0 <= float(value) <= 2.0
-    )
+    return isinstance(value, (int, float)) and -2.0 <= float(value) <= 2.0
 
 
 def _valid_stop(value):
-    return isinstance(value, list) and all(isinstance(item, str) and item for item in value)
+    # Empty lists resolve to no override so downstream can trust that a
+    # resolved `stop` is always meaningful.
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and item for item in value)
+    )
 
 
 # Per-request `sampling` fields honored from the input row, with their
@@ -168,14 +162,13 @@ def build_query_kwargs(args, messages, max_tokens=None, sampling=None):
         extra_body["top_k"] = args.top_k
 
     # Per-request overrides land after the CLI globals so a row's own
-    # sampling policy wins field by field (resolve_row_sampling already
-    # dropped anything invalid).
+    # sampling policy wins field by field. resolve_row_sampling is the sole
+    # producer and only emits validated, meaningful values, so they are
+    # trusted verbatim here.
     if sampling:
-        for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+        for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty", "stop"):
             if key in sampling:
                 query_kwargs[key] = sampling[key]
-        if sampling.get("stop"):
-            query_kwargs["stop"] = sampling["stop"]
         if "top_k" in sampling:
             extra_body["top_k"] = sampling["top_k"]
 

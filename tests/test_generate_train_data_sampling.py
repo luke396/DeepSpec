@@ -97,9 +97,15 @@ def test_invalid_fields_fall_back_per_field_and_count():
     }
 
     counts = _fresh_counts()
+    # JSON booleans ride Python's int subtype: True resolves as top_k=1.
+    # The server is the judge of taste here; resolution only screens what
+    # would corrupt the request shape.
     mixed = {"sampling": {"temperature": 0.6, "top_k": True}}
-    assert generate_train_data.resolve_row_sampling(mixed, counts) == {"temperature": 0.6}
-    assert counts["top_k"] == 1
+    assert generate_train_data.resolve_row_sampling(mixed, counts) == {
+        "temperature": 0.6,
+        "top_k": True,
+    }
+    assert sum(counts.values()) == 0
 
 
 def test_above_one_temperature_from_traffic_is_honored():
@@ -111,6 +117,15 @@ def test_above_one_temperature_from_traffic_is_honored():
     )
     assert overrides == {"temperature": 1.33}
     assert sum(counts.values()) == 0
+
+
+def test_empty_stop_is_rejected_at_resolution():
+    counts = _fresh_counts()
+    overrides = generate_train_data.resolve_row_sampling(
+        {"sampling": {"stop": []}}, counts
+    )
+    assert overrides == {}
+    assert counts["stop"] == 1
 
 
 def test_disabled_top_k_passes_through():
